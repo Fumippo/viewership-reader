@@ -1,5 +1,6 @@
 
 
+
 from __future__ import annotations
 
 import argparse
@@ -143,6 +144,7 @@ def trace_station_line(
     centers = np.full(len(x_grid), np.nan)
 
     target = np.array(rgb, dtype=int)
+    previous_y = None
 
     for i, x in enumerate(x_grid):
         col = arr[y_min:y_max + 1, x, :].astype(int)
@@ -152,8 +154,33 @@ def trace_station_line(
             mask = np.max(np.abs(col - target), axis=1) <= tolerance
 
         ys = np.where(mask)[0] + y_min
-        if len(ys):
-            centers[i] = float(np.median(ys))
+        if not len(ys):
+            continue
+
+        # 同じ色の連続した縦区間ごとに分割する。
+        # 折れ線は通常数pxだが、上部カードは数十〜数百pxあるため除外できる。
+        groups = []
+        current = [int(ys[0])]
+        for y in ys[1:]:
+            y = int(y)
+            if y - current[-1] <= 1:
+                current.append(y)
+            else:
+                groups.append(current)
+                current = [y]
+        groups.append(current)
+
+        thin_groups = [g for g in groups if len(g) <= 14]
+        candidates = thin_groups if thin_groups else groups
+        candidate_centers = [float(np.median(g)) for g in candidates]
+
+        if previous_y is None:
+            chosen = candidate_centers[-1]
+        else:
+            chosen = min(candidate_centers, key=lambda y: abs(y - previous_y))
+
+        centers[i] = chosen
+        previous_y = chosen
 
     good = ~np.isnan(centers)
     if good.sum() < 10:
@@ -172,13 +199,7 @@ def build_dataframe(
     x1 = int(round(calibration.graph_right))
     h = arr.shape[0]
 
-    # 上部の局カードや凡例を折れ線と誤認しないよう、
-    # グラフ領域の上端より上は検索対象から除外する。
-    graph_top_guard = int(h * 0.28)
-    y_min = max(
-        graph_top_guard,
-        int(calibration.y_zero - calibration.pixels_per_percent * 30),
-    )
+    y_min = max(0, int(calibration.y_zero - calibration.pixels_per_percent * 30))
     y_max = min(h - 1, int(calibration.y_zero + 10))
 
     traces: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
@@ -399,4 +420,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
