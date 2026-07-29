@@ -12,7 +12,7 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 
-from tval_reader import (
+from reader import (
     Calibration,
     STATION_COLORS,
     build_dataframe,
@@ -218,3 +218,4 @@ if run:
         st.info(
             "まず色検出の許容差を2〜5へ上げて再実行してください。"
         )
+
