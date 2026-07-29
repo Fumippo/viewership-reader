@@ -13,8 +13,8 @@ import streamlit as st
 from PIL import Image
 
 
-APP_VERSION = "7.0.2-cache-bypass"
-EXPECTED_READER_VERSION = "7.0.1-hourline-layout-fix"
+APP_VERSION = "8.1.0-regression-tested"
+EXPECTED_READER_VERSION = "8.1.0-regression-tested"
 
 
 def load_reader_from_current_source():
@@ -148,12 +148,13 @@ if st.button("解析する", type="primary", use_container_width=True):
         )
     except Exception as exc:
         st.error(
-            "安全基準を満たさなかったため、壊れたCSVは出力しません。"
+            "グラフ本体を特定できなかったため解析できませんでした。"
+            "時刻線不足・追跡開始点・通常の色欠損だけでは停止しない版です。"
         )
         st.exception(exc)
         st.stop()
 
-    st.success("解析完了。検出率・連続欠損の安全検査も通過しました。")
+    st.success("解析完了。欠損がある場合も品質表示付きでCSVを出力します。")
 
     diagnostic_rows = []
     for station, values in diagnostics.items():
@@ -161,13 +162,30 @@ if st.button("解析する", type="primary", use_container_width=True):
             {
                 "局": station,
                 "検出率": values["coverage"] * 100,
+                "品質": values.get("quality", "?"),
+                "最長欠損(分)": values.get("max_gap_minutes", 0.0),
                 "最長欠損(px)": values["max_gap_pixels"],
                 "除外した異常ジャンプ": values["rejected_jumps"],
             }
         )
     diagnostic_df = pd.DataFrame(diagnostic_rows)
 
-    with st.expander("自動較正・安全診断", expanded=True):
+    quality_values = set(diagnostic_df["品質"].astype(str))
+    if "C" in quality_values:
+        st.warning(
+            "品質Cの局があります。CSVは出力しますが、長い欠損区間は補間値です。"
+        )
+    elif "B" in quality_values:
+        st.info(
+            "品質Bの局があります。CSVは出力します。最長欠損区間は診断表を確認してください。"
+        )
+
+    if calibration.time_axis_method != "hour-lines":
+        st.info(
+            "正時線が不足または不規則だったため、6局の色線範囲から時間軸を復元しました。"
+        )
+
+    with st.expander("自動較正・品質診断", expanded=True):
         st.json(
             {
                 "解析エンジン": reader.READER_VERSION,
@@ -184,10 +202,17 @@ if st.button("解析する", type="primary", use_container_width=True):
                     calibration.pixels_per_minute,
                     3,
                 ),
+                "時間軸方式": calibration.time_axis_method,
+                "採用した正時線": calibration.time_line_inliers,
             }
         )
         st.dataframe(
-            diagnostic_df.style.format({"検出率": "{:.1f}%"}),
+            diagnostic_df.style.format(
+                {
+                    "検出率": "{:.1f}%",
+                    "最長欠損(分)": "{:.2f}",
+                }
+            ),
             use_container_width=True,
         )
 
