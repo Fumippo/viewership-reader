@@ -1,67 +1,50 @@
-
 from __future__ import annotations
 
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
-import tempfile
-import zipfile
+import hashlib
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
-import numpy as np
 
-from reader import (
-    Calibration,
-    STATION_COLORS,
-    build_dataframe,
-    detect_horizontal_gridlines,
-    estimate_y_scale,
-    find_color_x_range,
-    save_graphs,
-)
+from reader import STATION_COLORS, build_calibration, build_dataframe
 
 
-st.set_page_config(
-    page_title="視聴率グラフ読取",
-    page_icon="📺",
-    layout="wide",
-)
-
+st.set_page_config(page_title="視聴率グラフ読取", page_icon="📺", layout="wide")
 st.title("📺 TVAL画像から視聴率を1分刻みで抽出")
-st.caption("画像を選び、右端の日時を入れるだけです。")
 
 uploaded = st.file_uploader(
     "TVALのスクリーンショットを選択",
     type=["png", "jpg", "jpeg", "webp"],
 )
 
-end_date = st.date_input("画像右端の日付", value=datetime.now().date())
-
-default_time_text = datetime.now().strftime("%H:%M")
+end_date = st.date_input("画面下部「データ更新」の日付", value=datetime.now().date())
 end_time_text = st.text_input(
-    "画像右端の時刻",
-    value=default_time_text,
+    "画面下部「データ更新」の時刻",
+    value=datetime.now().strftime("%H:%M"),
     placeholder="例: 19:00",
-    help="24時間分の一覧から選ぶ必要はありません。HH:MM形式で直接入力してください。",
 )
 
-duration = st.number_input(
-    "表示時間（分）",
-    min_value=30,
-    max_value=360,
-    value=180,
-    step=1,
-)
-
+duration = st.number_input("表示時間（分）", 30, 360, 180, 1)
 tolerance = st.slider(
     "色検出の許容差",
-    min_value=0,
-    max_value=10,
-    value=0,
-    help="通常は0。線を検出できない場合だけ2〜5へ上げます。",
+    8,
+    50,
+    24,
+    help="低画質画像ほど大きめにします。通常は24前後。",
 )
+
+if uploaded is not None:
+    raw = uploaded.getvalue()
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    image = Image.open(BytesIO(raw)).convert("RGB")
+    st.info(
+        f"読み込んだ画像: {uploaded.name} / "
+        f"{image.width}×{image.height}px / 識別ID {digest}"
+    )
+    st.image(image, caption="今回実際に解析する画像", use_container_width=True)
 
 run = st.button("解析する", type="primary", use_container_width=True)
 
@@ -73,158 +56,95 @@ if run:
     try:
         parsed_time = datetime.strptime(end_time_text.strip(), "%H:%M").time()
     except ValueError:
-        st.error("時刻は 19:00 のように HH:MM 形式で入力してください。")
+        st.error("時刻は19:00のように入力してください。")
         st.stop()
 
+    raw = uploaded.getvalue()
+    image = Image.open(BytesIO(raw)).convert("RGB")
+    arr = np.array(image)
     end_dt = datetime.combine(end_date, parsed_time)
 
     try:
-        image = Image.open(uploaded).convert("RGB")
-        arr = np.array(image)
-
-        color_left, color_right = find_color_x_range(arr)
-        gridlines = detect_horizontal_gridlines(
+        calibration = build_calibration(
             arr,
-            int(color_left),
-            int(color_right),
-        )
-        y_zero, pixels_per_percent = estimate_y_scale(gridlines)
-
-        calibration = Calibration(
-            graph_left=float(color_left),
-            graph_right=float(color_right),
-            y_zero=float(y_zero),
-            pixels_per_percent=float(pixels_per_percent),
             end_time=end_dt,
             duration_minutes=int(duration),
         )
-
-        with st.spinner("画像の折れ線を追跡しています…"):
-            df = build_dataframe(
-                arr,
-                calibration,
-                tolerance=int(tolerance),
-            )
-
-        stations = list(STATION_COLORS)
-
-        st.success("解析完了")
-
-        c1, c2, c3, c4 = st.columns(4)
-        max_row = df.loc[df["6局合計"].idxmax()]
-        min_row = df.loc[df["6局合計"].idxmin()]
-
-        c1.metric(
-            "合計最大",
-            f'{max_row["6局合計"]:.1f}%',
-            max_row["日時"].strftime("%H:%M"),
+        df, coverage = build_dataframe(
+            arr,
+            calibration,
+            tolerance=int(tolerance),
         )
-        c2.metric(
-            "合計最小",
-            f'{min_row["6局合計"]:.1f}%',
-            min_row["日時"].strftime("%H:%M"),
-        )
-        c3.metric(
-            "開始",
-            calibration.start_time.strftime("%H:%M"),
-        )
-        c4.metric(
-            "終了",
-            calibration.end_time.strftime("%H:%M"),
-        )
-
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["各局視聴率", "シェア率", "順位割合", "全データ"]
-        )
-
-        with tab1:
-            chart_df = df.set_index("日時")[stations]
-            st.line_chart(chart_df, height=480)
-
-            total_df = df.set_index("日時")[["6局合計"]]
-            st.subheader("6局合計")
-            st.line_chart(total_df, height=320)
-
-        with tab2:
-            share_cols = [f"{s}_シェア" for s in stations]
-            share_df = df.set_index("日時")[share_cols].copy()
-            share_df.columns = stations
-            st.line_chart(share_df, height=480)
-
-            weighted_share = (
-                df[stations].sum() / df["6局合計"].sum() * 100
-            ).sort_values(ascending=False)
-
-            share_table = weighted_share.rename("加重シェア率").to_frame()
-            share_table["平均視聴率"] = df[stations].mean()
-            share_table = share_table.sort_values(
-                "加重シェア率",
-                ascending=False,
-            )
-            st.dataframe(
-                share_table.style.format(
-                    {
-                        "加重シェア率": "{:.2f}%",
-                        "平均視聴率": "{:.2f}%",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-        with tab3:
-            rank_cols = [f"{s}_順位" for s in stations]
-            rank_rates = pd.DataFrame(index=stations)
-
-            for station in stations:
-                for rank in range(1, 7):
-                    rank_rates[f"{rank}位"] = rank_rates.get(
-                        f"{rank}位",
-                        pd.Series(index=stations, dtype=float),
-                    )
-                    rank_rates.loc[station, f"{rank}位"] = (
-                        df[f"{station}_順位"].eq(rank).mean() * 100
-                    )
-
-            st.bar_chart(rank_rates, height=480)
-            st.dataframe(
-                rank_rates.style.format("{:.2f}%"),
-                use_container_width=True,
-            )
-
-        with tab4:
-            st.dataframe(df, use_container_width=True, height=520)
-
-        csv_bytes = df.to_csv(
-            index=False,
-            encoding="utf-8-sig",
-            date_format="%Y/%m/%d %H:%M",
-        ).encode("utf-8-sig")
-
-        st.download_button(
-            "CSVをダウンロード",
-            data=csv_bytes,
-            file_name=f'{end_dt.strftime("%Y%m%d_%H%M")}_viewership.csv',
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        with st.expander("自動較正結果"):
-            st.write(
-                {
-                    "グラフ左端px": round(calibration.graph_left, 1),
-                    "グラフ右端px": round(calibration.graph_right, 1),
-                    "0%線px": round(calibration.y_zero, 1),
-                    "1%あたりpx": round(
-                        calibration.pixels_per_percent,
-                        2,
-                    ),
-                }
-            )
-
     except Exception as exc:
         st.error("解析に失敗しました。")
         st.exception(exc)
-        st.info(
-            "まず色検出の許容差を2〜5へ上げて再実行してください。"
+        st.stop()
+
+    st.success("解析完了")
+
+    low_coverage = {k: v for k, v in coverage.items() if v < 0.20}
+    if low_coverage:
+        st.warning(
+            "線の検出率が低い局があります。結果が同じ・不自然な場合は、"
+            "色検出の許容差を少し上げてください。"
         )
+
+    with st.expander("画像別の自動較正・検出率"):
+        st.json(
+            {
+                "画像サイズ": f"{image.width}×{image.height}",
+                "グラフ左端": round(calibration.graph_left, 1),
+                "グラフ右端": round(calibration.graph_right, 1),
+                "グラフ上端": round(calibration.graph_top, 1),
+                "0%線": round(calibration.y_zero, 1),
+                "1%あたりpx": round(calibration.pixels_per_percent, 2),
+                "局別検出率": {
+                    k: f"{v * 100:.1f}%"
+                    for k, v in coverage.items()
+                },
+            }
+        )
+
+    stations = list(STATION_COLORS)
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["各局視聴率", "シェア率", "順位割合", "全データ"]
+    )
+
+    with tab1:
+        st.line_chart(df.set_index("日時")[stations], height=480)
+        st.subheader("6局合計")
+        st.line_chart(df.set_index("日時")[["6局合計"]], height=300)
+
+    with tab2:
+        share_cols = [f"{s}_シェア" for s in stations]
+        share_df = df.set_index("日時")[share_cols].copy()
+        share_df.columns = stations
+        st.line_chart(share_df, height=480)
+
+    with tab3:
+        rank_rates = pd.DataFrame(index=stations)
+        for rank in range(1, 7):
+            rank_rates[f"{rank}位"] = [
+                df[f"{station}_順位"].eq(rank).mean() * 100
+                for station in stations
+            ]
+        st.bar_chart(rank_rates, height=480)
+        st.dataframe(rank_rates.style.format("{:.2f}%"), use_container_width=True)
+
+    with tab4:
+        st.dataframe(df, use_container_width=True, height=520)
+
+    csv_bytes = df.to_csv(
+        index=False,
+        encoding="utf-8-sig",
+        date_format="%Y/%m/%d %H:%M",
+    ).encode("utf-8-sig")
+
+    st.download_button(
+        "CSVをダウンロード",
+        csv_bytes,
+        file_name=f'{end_dt.strftime("%Y%m%d_%H%M")}_viewership.csv',
+        mime="text/csv",
+        use_container_width=True,
+    )
 
