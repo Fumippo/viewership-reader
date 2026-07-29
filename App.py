@@ -12,7 +12,7 @@ from PIL import Image
 import reader
 
 
-EXPECTED_READER_VERSION = "6.0.0-grid-time-recovery"
+EXPECTED_READER_VERSION = "7.0.1-hourline-layout-fix"
 
 st.set_page_config(
     page_title="視聴率グラフ読取",
