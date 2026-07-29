@@ -1,4 +1,5 @@
 
+
 from __future__ import annotations
 
 import argparse
@@ -171,7 +172,13 @@ def build_dataframe(
     x1 = int(round(calibration.graph_right))
     h = arr.shape[0]
 
-    y_min = max(0, int(calibration.y_zero - calibration.pixels_per_percent * 30))
+    # 上部の局カードや凡例を折れ線と誤認しないよう、
+    # グラフ領域の上端より上は検索対象から除外する。
+    graph_top_guard = int(h * 0.28)
+    y_min = max(
+        graph_top_guard,
+        int(calibration.y_zero - calibration.pixels_per_percent * 30),
+    )
     y_max = min(h - 1, int(calibration.y_zero + 10))
 
     traces: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
@@ -392,3 +399,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
