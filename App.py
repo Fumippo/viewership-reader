@@ -3,16 +3,48 @@ from __future__ import annotations
 from datetime import datetime
 from io import BytesIO
 import hashlib
+import importlib.util
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
 
-import reader
 
-
+APP_VERSION = "7.0.2-cache-bypass"
 EXPECTED_READER_VERSION = "7.0.1-hourline-layout-fix"
+
+
+def load_reader_from_current_source():
+    """
+    Streamlitのsys.modulesキャッシュを使わず、
+    App.pyと同じフォルダのreader.pyを現在の内容から直接読み込む。
+    """
+    reader_path = Path(__file__).resolve().with_name("reader.py")
+    if not reader_path.exists():
+        raise FileNotFoundError(f"reader.pyが見つかりません: {reader_path}")
+
+    source_bytes = reader_path.read_bytes()
+    source_hash = hashlib.sha256(source_bytes).hexdigest()[:12]
+    module_name = f"viewership_reader_{source_hash}"
+
+    # 同じソースなら既存モジュールを再利用し、内容が変われば別名で必ず再読込。
+    if module_name in sys.modules:
+        return sys.modules[module_name], source_hash, reader_path
+
+    spec = importlib.util.spec_from_file_location(module_name, reader_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"reader.pyを読み込めません: {reader_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module, source_hash, reader_path
+
+
+reader, READER_SOURCE_HASH, READER_SOURCE_PATH = load_reader_from_current_source()
 
 st.set_page_config(
     page_title="視聴率グラフ読取",
@@ -24,12 +56,18 @@ if getattr(reader, "READER_VERSION", None) != EXPECTED_READER_VERSION:
     st.error(
         "App.pyとreader.pyの版が一致していません。"
         f"必要版: {EXPECTED_READER_VERSION} / "
-        f"読込版: {getattr(reader, 'READER_VERSION', '旧版・不明')}"
+        f"読込版: {getattr(reader, 'READER_VERSION', '旧版・不明')} / "
+        f"読込元: {READER_SOURCE_PATH} / "
+        f"ソース識別ID: {READER_SOURCE_HASH}"
     )
     st.stop()
 
 st.title("📺 TVAL画像から1分刻み視聴率を抽出")
-st.caption(f"解析エンジン: {reader.READER_VERSION}")
+st.caption(
+    f"アプリ: {APP_VERSION} / "
+    f"解析エンジン: {reader.READER_VERSION} / "
+    f"reader.py識別ID: {READER_SOURCE_HASH}"
+)
 
 uploaded = st.file_uploader(
     "スクリーンショットを選択",
@@ -209,4 +247,3 @@ if st.button("解析する", type="primary", use_container_width=True):
         mime="text/csv",
         use_container_width=True,
     )
-
