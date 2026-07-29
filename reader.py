@@ -2,6 +2,7 @@
 
 
 
+
 from __future__ import annotations
 
 import argparse
@@ -145,7 +146,6 @@ def trace_station_line(
     centers = np.full(len(x_grid), np.nan)
 
     target = np.array(rgb, dtype=int)
-    previous_y = None
 
     for i, x in enumerate(x_grid):
         col = arr[y_min:y_max + 1, x, :].astype(int)
@@ -155,33 +155,8 @@ def trace_station_line(
             mask = np.max(np.abs(col - target), axis=1) <= tolerance
 
         ys = np.where(mask)[0] + y_min
-        if not len(ys):
-            continue
-
-        # 同じ色の連続した縦区間ごとに分割する。
-        # 折れ線は通常数pxだが、上部カードは数十〜数百pxあるため除外できる。
-        groups = []
-        current = [int(ys[0])]
-        for y in ys[1:]:
-            y = int(y)
-            if y - current[-1] <= 1:
-                current.append(y)
-            else:
-                groups.append(current)
-                current = [y]
-        groups.append(current)
-
-        thin_groups = [g for g in groups if len(g) <= 14]
-        candidates = thin_groups if thin_groups else groups
-        candidate_centers = [float(np.median(g)) for g in candidates]
-
-        if previous_y is None:
-            chosen = candidate_centers[-1]
-        else:
-            chosen = min(candidate_centers, key=lambda y: abs(y - previous_y))
-
-        centers[i] = chosen
-        previous_y = chosen
+        if len(ys):
+            centers[i] = float(np.median(ys))
 
     good = ~np.isnan(centers)
     if good.sum() < 10:
@@ -200,8 +175,25 @@ def build_dataframe(
     x1 = int(round(calibration.graph_right))
     h = arr.shape[0]
 
-    y_min = max(0, int(calibration.y_zero - calibration.pixels_per_percent * 30))
-    y_max = min(h - 1, int(calibration.y_zero + 10))
+    # グラフ上端を水平グリッド列から逆算する。
+    # 0%線から2ポイント刻みで上へたどり、実在する最上段だけを採用する。
+    gridlines = detect_horizontal_gridlines(arr, x0, x1)
+    step = calibration.pixels_per_percent * 2.0
+    graph_top = calibration.y_zero
+    expected = calibration.y_zero - step
+    tolerance_px = max(4.0, step * 0.08)
+
+    while expected >= 0:
+        nearest = min(gridlines, key=lambda y: abs(y - expected))
+        if abs(nearest - expected) <= tolerance_px:
+            graph_top = float(nearest)
+            expected -= step
+        else:
+            break
+
+    # 上部の局カードを完全に検索対象外にする。
+    y_min = max(0, int(round(graph_top - 6)))
+    y_max = min(h - 1, int(round(calibration.y_zero + 10)))
 
     traces: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     for station, rgb in STATION_COLORS.items():
