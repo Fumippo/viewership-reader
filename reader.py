@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 
-READER_VERSION = "6.0.0-grid-time-recovery"
+READER_VERSION = "7.0.1-hourline-layout-fix"
 
 STATION_COLORS: Dict[str, Tuple[int, int, int]] = {
     "NHK総合": (182, 188, 195),
@@ -165,32 +165,58 @@ def _select_regular_grid(lines: list[int], image_height: int) -> tuple[list[int]
     return grid, gap
 
 
+
 def _find_rough_graph_x_bounds(arr: np.ndarray, grid: list[int]) -> tuple[int, int]:
     """
-    選んだ全水平線で共通して灰色になっている横範囲をグラフ領域とする。
+    上側の水平グリッド線からグラフ左右端を推定する。
+
+    全水平線の共通部分を取る旧方式は、下側の線が番組線で分断されると
+    右端を途中で切ってしまうため廃止。
     """
-    rows = arr[np.array(grid, dtype=int)]
-    mask = _neutral_gray_mask(
-        rows,
-        max_spread=25,
-        min_brightness=190,
-        max_brightness=253,
-    )
-    column_score = mask.mean(axis=0)
+    h, w, _ = arr.shape
+    spans: list[tuple[int, int]] = []
 
-    candidates = np.where(column_score >= 0.75)[0]
-    groups = _group_consecutive(candidates, max_gap=6)
+    # 上側は折れ線の交差が少なく、水平線が最も長く残りやすい。
+    rows_to_use = grid[: min(3, len(grid))]
 
-    if not groups:
+    for y in rows_to_use:
+        row = arr[y:y + 1]
+        mask = _neutral_gray_mask(
+            row,
+            max_spread=25,
+            min_brightness=190,
+            max_brightness=253,
+        )[0]
+
+        xs = np.where(mask)[0]
+        if len(xs) == 0:
+            continue
+
+        groups = _group_consecutive(xs, max_gap=18)
+        long_groups = [
+            group for group in groups
+            if group[-1] - group[0] + 1 >= max(80, int(w * 0.05))
+        ]
+        if not long_groups:
+            continue
+
+        left = min(group[0] for group in long_groups)
+        right = max(group[-1] for group in long_groups)
+
+        if right - left >= w * 0.55:
+            spans.append((left, right))
+
+    if not spans:
         raise RuntimeError("グラフ左右端を検出できませんでした。")
 
-    longest = max(groups, key=lambda group: group[-1] - group[0])
-    left, right = longest[0], longest[-1]
+    left = int(round(np.median([span[0] for span in spans])))
+    right = int(round(np.median([span[1] for span in spans])))
 
-    if right - left < arr.shape[1] * 0.45:
+    if right - left < w * 0.55:
         raise RuntimeError("検出したグラフ幅が狭すぎます。")
 
-    return int(left), int(right)
+    return left, right
+
 
 
 def _find_vertical_hour_lines(
@@ -201,8 +227,9 @@ def _find_vertical_hour_lines(
     rough_right: int,
 ) -> list[int]:
     """
-    1時間刻みの縦破線を抽出する。
-    選択カーソルの実線は縦方向スコアが高すぎるため除外する。
+    縦破線の局所ピークを抽出する。
+
+    太い左端UIや選択カーソルを一本の時線として誤認しない。
     """
     roi = arr[graph_top:graph_bottom + 1]
     mask = _neutral_gray_mask(
@@ -213,25 +240,23 @@ def _find_vertical_hour_lines(
     )
     column_score = mask.mean(axis=0)
 
-    x_axis = np.arange(arr.shape[1])
-    candidates = np.where(
-        (column_score >= 0.35)
-        & (x_axis >= rough_left)
-        & (x_axis <= rough_right)
-    )[0]
-    groups = _group_consecutive(candidates, max_gap=2)
+    search_left = max(0, rough_left - 60)
+    search_right = min(arr.shape[1] - 1, int(arr.shape[1] * 0.98))
 
-    peaks: list[int] = []
-    for group in groups:
-        center = int(round(np.mean(group)))
-        score = float(np.max(column_score[group]))
+    candidates: list[tuple[int, float]] = []
+    for x in range(max(1, search_left), min(len(column_score) - 2, search_right) + 1):
+        score = float(column_score[x])
+        if not (0.30 <= score <= 0.79):
+            continue
+        if score >= column_score[x - 1] and score >= column_score[x + 1]:
+            candidates.append((x, score))
 
-        # 破線は2px前後。太いUI帯と連続実線カーソルを除外。
-        if len(group) <= 6 and 0.38 <= score <= 0.76:
-            peaks.append(center)
+    selected: list[tuple[int, float]] = []
+    for x, score in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if all(abs(x - old_x) > 20 for old_x, _ in selected):
+            selected.append((x, score))
 
-    return sorted(set(peaks))
-
+    return sorted(x for x, _ in selected)
 
 def _select_hour_progression(peaks: list[int]) -> list[int]:
     if len(peaks) < 2:
@@ -267,6 +292,8 @@ def _select_hour_progression(peaks: list[int]) -> list[int]:
     return best
 
 
+
+
 def _calibrate_time_axis(
     arr: np.ndarray,
     grid: list[int],
@@ -276,8 +303,10 @@ def _calibrate_time_axis(
     duration_minutes: int,
 ) -> tuple[float, float, float]:
     """
-    水平グリッドの左右端ではなく、1時間刻みの縦破線から時間軸を較正する。
-    これによりグラフ内側の余白を時間として数える誤差を防ぐ。
+    検出時線を、表示期間内に存在する正時の候補へ割り当てる。
+
+    最初の正時線が選択カーソルと重なって消えていても、17:00・18:00
+    など残った時線から開始位置を復元する。
     """
     peaks = _find_vertical_hour_lines(
         arr,
@@ -289,31 +318,68 @@ def _calibrate_time_axis(
     hours = _select_hour_progression(peaks)
 
     if len(hours) < 2:
-        # 縦破線が取れない画像だけ、粗い左右端へフォールバック。
-        pixels_per_minute = (rough_right - rough_left) / duration_minutes
-        return float(rough_left), float(rough_right), float(pixels_per_minute)
+        raise RuntimeError("縦の時刻目盛りを2本以上検出できませんでした。")
 
     hour_spacing = float(np.median(np.diff(hours)))
     pixels_per_minute = hour_spacing / 60.0
 
-    rightmost_hour_x = float(hours[-1])
-    end_x = rightmost_hour_x + end_time.minute * pixels_per_minute
+    start_time = end_time - timedelta(minutes=duration_minutes)
+    first_hour_offset = (-start_time.minute) % 60
+    expected_offsets = list(
+        range(first_hour_offset, duration_minutes + 1, 60)
+    )
 
-    # ちょうど00分でカーソルと重なり、最新の時線が除外された場合の補正。
-    if end_x < rough_right - 0.55 * hour_spacing:
-        end_x += hour_spacing
+    best: tuple[float, float] | None = None
 
-    start_x = end_x - duration_minutes * pixels_per_minute
+    for detected_x in hours:
+        for offset in expected_offsets:
+            candidate_start = detected_x - offset * pixels_per_minute
+            predicted = np.array(
+                [
+                    candidate_start + expected_offset * pixels_per_minute
+                    for expected_offset in expected_offsets
+                ],
+                dtype=float,
+            )
 
-    allowed_margin = hour_spacing * 0.15
-    if (
-        start_x < rough_left - allowed_margin
-        or end_x > rough_right + allowed_margin
-    ):
+            residual = sum(
+                float(np.min(np.abs(predicted - hour_x)))
+                for hour_x in hours
+            )
+            score = residual + 0.15 * abs(candidate_start - rough_left)
+
+            candidate_end = (
+                candidate_start
+                + duration_minutes * pixels_per_minute
+            )
+            if candidate_start < -30 or candidate_end > arr.shape[1] + 30:
+                score += 1000.0
+
+            if best is None or score < best[0]:
+                best = (score, candidate_start)
+
+    if best is None:
         raise RuntimeError("縦の時刻目盛りから時間軸を較正できませんでした。")
 
-    return float(start_x), float(end_x), float(pixels_per_minute)
+    start_x = float(best[1])
+    end_x = start_x + duration_minutes * pixels_per_minute
 
+    # 時線同士が予測位置に並ぶことを最終確認。
+    predicted = np.array(
+        [
+            start_x + expected_offset * pixels_per_minute
+            for expected_offset in expected_offsets
+        ],
+        dtype=float,
+    )
+    max_residual = max(
+        float(np.min(np.abs(predicted - hour_x)))
+        for hour_x in hours
+    )
+    if max_residual > max(7.0, hour_spacing * 0.025):
+        raise RuntimeError("縦の時刻目盛りの間隔が不規則です。")
+
+    return start_x, end_x, pixels_per_minute
 
 def _station_color_mask(
     roi: np.ndarray,
@@ -326,13 +392,13 @@ def _station_color_mask(
     distance = np.max(np.abs(work - target), axis=2)
 
     if station == "NHK総合":
-        # NHK灰色と薄い水平グリッドを分離する。
+        # JPEG圧縮されたNHK灰色も拾う一方、明るいグリッド線は除外。
         spread = work.max(axis=2) - work.min(axis=2)
         brightness = work.mean(axis=2)
         return (
-            (distance <= 30)
-            & (brightness < 218)
-            & (spread <= 40)
+            (distance <= 48)
+            & (brightness < 230)
+            & (spread <= 55)
         )
 
     return distance <= tolerance
@@ -342,78 +408,105 @@ def _trace_station(
     arr: np.ndarray,
     station: str,
     color: Tuple[int, int, int],
-    rough_left: int,
-    rough_right: int,
+    trace_left: int,
+    trace_right: int,
     graph_top: int,
     graph_bottom: int,
     pixels_per_percent: float,
     tolerance: int,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
     """
-    色線を左から追う。
+    時間軸の中央付近から左右へ追跡する。
 
-    重要:
-    - 大きな縦カーソル列を除外
-    - 最初の孤立1pxを開始点にしない
-    - 不自然な単発大ジャンプは捨てる
-    - ただし前回のように永久停止せず、元の線が戻れば追跡再開
+    左端の選択カーソル丸を開始点にして別の灰色へ張り付く事故を防ぐ。
     """
+    x0 = max(0, int(trace_left))
+    x1 = min(arr.shape[1] - 1, int(trace_right))
+
     roi = arr[
         graph_top:graph_bottom + 1,
-        rough_left:rough_right + 1,
+        x0:x1 + 1,
     ]
     mask = _station_color_mask(roi, station, color, tolerance)
 
-    # 選択カーソルの縦線など、縦一列に大量の同色がある列を除外。
     column_counts = mask.sum(axis=0)
-    vertical_limit = max(80, int(mask.shape[0] * 0.15))
+
+    # NHKの灰色カーソル丸は周辺列まで灰色が多いため、専用の低い上限を使う。
+    # これでカーソル円周を折れ線として読む事故を防ぐ。
+    vertical_limit = (
+        24
+        if station == "NHK総合"
+        else max(80, int(mask.shape[0] * 0.15))
+    )
     mask[:, column_counts > vertical_limit] = False
 
-    xs = np.arange(rough_left, rough_right + 1)
+    xs = np.arange(x0, x1 + 1)
     ys = np.full(len(xs), np.nan)
+    center = len(xs) // 2
 
-    previous_y: float | None = None
+    anchor_index: int | None = None
+    anchor_y: float | None = None
+
+    # 中央から外へ探し、候補が一つだけの安定した列を開始点にする。
+    for radius in range(len(xs)):
+        test_indices = [center - radius, center + radius]
+        for index in test_indices:
+            if index < 0 or index >= len(xs):
+                continue
+
+            positions = np.where(mask[:, index])[0]
+            if len(positions) == 0:
+                continue
+
+            groups = _group_consecutive(positions, max_gap=1)
+            strong = [group for group in groups if len(group) >= 2]
+
+            if len(strong) == 1:
+                anchor_index = index
+                anchor_y = float(np.median(strong[0])) + graph_top
+                break
+
+        if anchor_index is not None:
+            break
+
+    if anchor_index is None or anchor_y is None:
+        raise RuntimeError(f"{station}の追跡開始点を特定できませんでした。")
+
+    ys[anchor_index] = anchor_y
     rejected_jumps = 0
     max_single_column_jump = max(70.0, pixels_per_percent * 1.5)
 
-    for index in range(mask.shape[1]):
-        positions = np.where(mask[:, index])[0]
-        if len(positions) == 0:
-            continue
+    for direction in (1, -1):
+        previous_y = anchor_y
+        index = anchor_index + direction
 
-        groups = _group_consecutive(positions, max_gap=1)
-        candidates = [
-            (
-                float(np.median(group)) + graph_top,
-                len(group),
-            )
-            for group in groups
-        ]
+        while 0 <= index < len(xs):
+            positions = np.where(mask[:, index])[0]
 
-        if previous_y is None:
-            # 孤立した1pxノイズで開始しない。
-            strong = [candidate for candidate in candidates if candidate[1] >= 2]
-            if not strong:
-                continue
-            chosen_y = max(strong, key=lambda candidate: candidate[1])[0]
-        else:
-            chosen = min(
-                candidates,
-                key=lambda candidate:
-                    abs(candidate[0] - previous_y)
-                    - min(candidate[1], 20) * 0.1,
-            )
+            if len(positions):
+                groups = _group_consecutive(positions, max_gap=1)
+                candidates = [
+                    (
+                        float(np.median(group)) + graph_top,
+                        len(group),
+                    )
+                    for group in groups
+                ]
 
-            # 1列だけ数百px飛ぶNHKカーソル周辺ノイズなどを拒否。
-            # 拒否してもprevious_yは維持し、正しい線が戻れば復帰できる。
-            if abs(chosen[0] - previous_y) > max_single_column_jump:
-                rejected_jumps += 1
-                continue
+                chosen = min(
+                    candidates,
+                    key=lambda candidate:
+                        abs(candidate[0] - previous_y)
+                        - min(candidate[1], 20) * 0.1,
+                )
 
-            chosen_y = chosen[0]
+                if abs(chosen[0] - previous_y) <= max_single_column_jump:
+                    ys[index] = chosen[0]
+                    previous_y = chosen[0]
+                else:
+                    rejected_jumps += 1
 
-        ys[index] = chosen_y
-        previous_y = chosen_y
+            index += direction
 
     good = ~np.isnan(ys)
     coverage = float(good.mean())
@@ -421,7 +514,6 @@ def _trace_station(
     missing_groups = _group_consecutive(np.where(~good)[0], max_gap=1)
     max_gap_pixels = max((len(group) for group in missing_groups), default=0)
 
-    # 壊れた結果を完成品として出さない安全装置。
     if coverage < 0.85:
         raise RuntimeError(
             f"{station}の線検出率が{coverage * 100:.1f}%しかありません。"
@@ -442,7 +534,6 @@ def _trace_station(
         "rejected_jumps": int(rejected_jumps),
     }
     return xs, interpolated, diagnostics
-
 
 def analyze_image(
     arr: np.ndarray,
@@ -491,8 +582,8 @@ def analyze_image(
             arr,
             station,
             color,
-            rough_left,
-            rough_right,
+            max(0, int(np.floor(start_x)) - 4),
+            min(arr.shape[1] - 1, int(np.ceil(end_x)) + 4),
             graph_top,
             y_zero,
             pixels_per_percent,
