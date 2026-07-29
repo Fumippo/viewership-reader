@@ -9,8 +9,10 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from reader import STATION_COLORS, analyze_image
+import reader
 
+
+EXPECTED_READER_VERSION = "6.0.0-grid-time-recovery"
 
 st.set_page_config(
     page_title="視聴率グラフ読取",
@@ -18,7 +20,16 @@ st.set_page_config(
     layout="wide",
 )
 
+if getattr(reader, "READER_VERSION", None) != EXPECTED_READER_VERSION:
+    st.error(
+        "App.pyとreader.pyの版が一致していません。"
+        f"必要版: {EXPECTED_READER_VERSION} / "
+        f"読込版: {getattr(reader, 'READER_VERSION', '旧版・不明')}"
+    )
+    st.stop()
+
 st.title("📺 TVAL画像から1分刻み視聴率を抽出")
+st.caption(f"解析エンジン: {reader.READER_VERSION}")
 
 uploaded = st.file_uploader(
     "スクリーンショットを選択",
@@ -33,7 +44,7 @@ end_date = st.date_input(
 end_time_text = st.text_input(
     "画面下部「データ更新」の時刻",
     value=datetime.now().strftime("%H:%M"),
-    placeholder="例: 19:00",
+    placeholder="例: 22:44",
 )
 
 duration = st.number_input(
@@ -46,10 +57,13 @@ duration = st.number_input(
 
 tolerance = st.slider(
     "色検出の許容差",
-    min_value=8,
-    max_value=50,
-    value=24,
-    help="元PNGは20〜24、圧縮画像は28〜36が目安です。",
+    min_value=20,
+    max_value=55,
+    value=42,
+    help=(
+        "低画質・圧縮画像に対応するため既定値を42にしています。"
+        "NHK灰色だけはグリッド誤認防止の専用条件を使います。"
+    ),
 )
 
 if uploaded is not None:
@@ -79,7 +93,7 @@ if st.button("解析する", type="primary", use_container_width=True):
             "%H:%M",
         ).time()
     except ValueError:
-        st.error("時刻は19:00のように入力してください。")
+        st.error("時刻は22:44のように入力してください。")
         st.stop()
 
     end_dt = datetime.combine(end_date, parsed_time)
@@ -88,39 +102,58 @@ if st.button("解析する", type="primary", use_container_width=True):
     arr = np.array(image)
 
     try:
-        df, calibration, coverage = analyze_image(
+        df, calibration, diagnostics = reader.analyze_image(
             arr=arr,
             end_time=end_dt,
             duration_minutes=int(duration),
             tolerance=int(tolerance),
         )
     except Exception as exc:
-        st.error("解析に失敗しました。")
+        st.error(
+            "安全基準を満たさなかったため、壊れたCSVは出力しません。"
+        )
         st.exception(exc)
         st.stop()
 
-    st.success("解析完了")
+    st.success("解析完了。検出率・連続欠損の安全検査も通過しました。")
 
-    with st.expander("自動較正・検出率"):
+    diagnostic_rows = []
+    for station, values in diagnostics.items():
+        diagnostic_rows.append(
+            {
+                "局": station,
+                "検出率": values["coverage"] * 100,
+                "最長欠損(px)": values["max_gap_pixels"],
+                "除外した異常ジャンプ": values["rejected_jumps"],
+            }
+        )
+    diagnostic_df = pd.DataFrame(diagnostic_rows)
+
+    with st.expander("自動較正・安全診断", expanded=True):
         st.json(
             {
+                "解析エンジン": reader.READER_VERSION,
                 "画像サイズ": f"{image.width}×{image.height}",
-                "グラフ左端": round(calibration.graph_left, 1),
-                "グラフ右端": round(calibration.graph_right, 1),
+                "時間軸左端": round(calibration.graph_left, 1),
+                "時間軸右端": round(calibration.graph_right, 1),
                 "グラフ上端": round(calibration.graph_top, 1),
                 "0%線": round(calibration.y_zero, 1),
                 "1%あたりpx": round(
                     calibration.pixels_per_percent,
                     2,
                 ),
-                "局別検出率": {
-                    station: f"{rate * 100:.1f}%"
-                    for station, rate in coverage.items()
-                },
+                "1分あたりpx": round(
+                    calibration.pixels_per_minute,
+                    3,
+                ),
             }
         )
+        st.dataframe(
+            diagnostic_df.style.format({"検出率": "{:.1f}%"}),
+            use_container_width=True,
+        )
 
-    stations = list(STATION_COLORS.keys())
+    stations = list(reader.STATION_COLORS)
     tab1, tab2, tab3, tab4 = st.tabs(
         ["各局視聴率", "シェア率", "順位割合", "全データ"]
     )
