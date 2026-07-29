@@ -107,41 +107,83 @@ def _find_graph_x_bounds(arr: np.ndarray, horizontal_lines: list[int]) -> tuple[
 
 def _estimate_vertical_scale(horizontal_lines: list[int]) -> tuple[float, float, float]:
     """
-    TVALの横線は通常2ポイント刻み。
-    最下段を0%、最上段をグラフ上端として扱う。
+    抜けている水平線があっても、最下段からの等間隔列を推定する。
+    UI内の短い別水平線が混ざっても、グラフ本体の周期を優先する。
     """
-    ys = np.array(sorted(horizontal_lines), dtype=float)
+    ys = np.array(sorted(set(horizontal_lines)), dtype=float)
     if len(ys) < 3:
         raise RuntimeError("水平グリッド線が不足しています。")
 
-    diffs = np.diff(ys)
-    diffs = diffs[diffs >= 8]
-    if len(diffs) < 2:
-        raise RuntimeError("縦軸間隔を推定できませんでした。")
-
-    gap0 = float(np.median(diffs))
-    regular = diffs[(diffs >= gap0 * 0.75) & (diffs <= gap0 * 1.25)]
-    gap = float(np.median(regular)) if len(regular) else gap0
-
     y_zero = float(max(ys))
-    selected = [y_zero]
-    current = y_zero
 
-    while True:
-        target = current - gap
-        nearby = ys[np.abs(ys - target) <= max(5.0, gap * 0.15)]
-        if len(nearby) == 0:
-            break
-        chosen = float(nearby[np.argmin(np.abs(nearby - target))])
-        selected.append(chosen)
-        current = chosen
+    # 観測された線同士の差を整数分割し、目盛間隔候補を作る。
+    candidates: list[float] = []
+    for i in range(len(ys)):
+        for j in range(i + 1, len(ys)):
+            diff = ys[j] - ys[i]
+            for steps in range(1, 9):
+                gap = diff / steps
+                if 35.0 <= gap <= 220.0:
+                    candidates.append(gap)
 
-    if len(selected) < 3:
+    if not candidates:
+        raise RuntimeError("縦軸間隔の候補を作れませんでした。")
+
+    best_gap: float | None = None
+    best_score = -1e9
+    best_matches: list[float] = []
+
+    for gap in candidates:
+        tolerance = max(5.0, gap * 0.08)
+        matches: list[float] = []
+        residual_sum = 0.0
+
+        # 最下段を0%線として上方向に最大12段確認。
+        for step in range(0, 13):
+            target = y_zero - step * gap
+            distances = np.abs(ys - target)
+            idx = int(np.argmin(distances))
+            distance = float(distances[idx])
+            if distance <= tolerance:
+                matched = float(ys[idx])
+                if matched not in matches:
+                    matches.append(matched)
+                    residual_sum += distance
+
+        # 4本以上一致する周期を強く優先。小さすぎる偽周期を軽く罰する。
+        score = len(matches) * 100.0 - residual_sum - max(0.0, 75.0 - gap) * 0.4
+
+        if score > best_score:
+            best_score = score
+            best_gap = float(gap)
+            best_matches = matches
+
+    if best_gap is None or len(best_matches) < 3:
         raise RuntimeError("規則的な水平グリッドを特定できませんでした。")
 
-    graph_top = min(selected)
+    # 近い候補を中央値で安定化。
+    close_candidates = [
+        gap for gap in candidates
+        if abs(gap - best_gap) <= max(2.0, best_gap * 0.025)
+    ]
+    gap = float(np.median(close_candidates)) if close_candidates else best_gap
+
+    tolerance = max(5.0, gap * 0.10)
+    matched_steps: list[int] = []
+    for step in range(0, 13):
+        target = y_zero - step * gap
+        if np.min(np.abs(ys - target)) <= tolerance:
+            matched_steps.append(step)
+
+    if len(matched_steps) < 3:
+        raise RuntimeError("規則的な水平グリッドを特定できませんでした。")
+
+    # 実際に検出できた最上位段までをグラフ範囲とする。
+    top_step = max(matched_steps)
+    graph_top = y_zero - top_step * gap
     pixels_per_percent = gap / 2.0
-    return graph_top, y_zero, pixels_per_percent
+
+    return float(graph_top), float(y_zero), float(pixels_per_percent)
 
 
 def build_calibration(
@@ -250,11 +292,14 @@ def analyze_image(
     coverage: dict[str, float] = {}
 
     for station, color in STATION_COLORS.items():
+        # NHK総合の灰色は水平グリッド線と近いため、許容差を狭くする。
+        station_tolerance = min(tolerance, 4) if station == "NHK総合" else tolerance
+
         xs, ys, station_coverage = _trace_one_station(
             arr=arr,
             color=color,
             calibration=calibration,
-            tolerance=tolerance,
+            tolerance=station_tolerance,
         )
         traces[station] = (xs, ys)
         coverage[station] = station_coverage
