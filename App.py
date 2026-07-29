@@ -38,10 +38,13 @@ uploaded = st.file_uploader(
 )
 
 end_date = st.date_input("画像右端の日付", value=datetime.now().date())
-end_time = st.time_input(
+
+default_time_text = datetime.now().strftime("%H:%M")
+end_time_text = st.text_input(
     "画像右端の時刻",
-    value=datetime.now().replace(second=0, microsecond=0).time(),
-    step=60,
+    value=default_time_text,
+    placeholder="例: 19:00",
+    help="24時間分の一覧から選ぶ必要はありません。HH:MM形式で直接入力してください。",
 )
 
 duration = st.number_input(
@@ -67,7 +70,13 @@ if run:
         st.error("先に画像を選んでください。")
         st.stop()
 
-    end_dt = datetime.combine(end_date, end_time)
+    try:
+        parsed_time = datetime.strptime(end_time_text.strip(), "%H:%M").time()
+    except ValueError:
+        st.error("時刻は 19:00 のように HH:MM 形式で入力してください。")
+        st.stop()
+
+    end_dt = datetime.combine(end_date, parsed_time)
 
     try:
         image = Image.open(uploaded).convert("RGB")
