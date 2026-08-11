@@ -13,8 +13,8 @@ import streamlit as st
 from PIL import Image
 
 
-APP_VERSION = "9.0.0-global-trace"
-EXPECTED_READER_VERSION = "9.0.0-global-trace"
+APP_VERSION = "9.1.0-antialias-trace"
+EXPECTED_READER_VERSION = "9.1.0-antialias-trace"
 
 
 def load_reader_from_current_source():
@@ -112,7 +112,7 @@ tolerance = st.slider(
     value=42,
     help=(
         "局色とのRGB差の許容範囲です。"
-        "9.0では二値判定だけでなく色距離を使う全幅経路追跡を行います。"
+        "9.1では局色と白背景のアンチエイリアス混色、および他局色との競合を考慮して全幅経路追跡を行います。"
     ),
 )
 
@@ -302,3 +302,4 @@ if st.button("解析する", type="primary", use_container_width=True):
         mime="text/csv",
         use_container_width=True,
     )
+
