@@ -1,5 +1,4 @@
 
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +8,7 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
-READER_VERSION = "9.0.0-global-trace"
+READER_VERSION = "9.1.0-antialias-trace"
 
 STATION_COLORS: Dict[str, Tuple[int, int, int]] = {
     "NHK総合": (182, 188, 195),
@@ -378,6 +377,86 @@ def _color_distance(roi: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.nda
     target = np.array(target_rgb, dtype=np.int16)
     return np.max(np.abs(work - target), axis=2)
 
+
+def _antialias_color_cost(
+    roi: np.ndarray,
+    target_rgb: Tuple[int, int, int],
+    *,
+    alpha_penalty: float = 35.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    「局色そのもの」だけでなく「局色と白背景の混色」も同じ色線として評価する。
+
+    ブラウザ描画では線の縁がアンチエイリアスされ、
+    target と白(255,255,255)の中間色になる。
+    単純なRGB距離だけだと、特にテレビ東京などの青線の薄い縁が
+    NHKの灰色へ近づき誤追跡の原因になる。
+
+    各ピクセルを white + alpha * (target - white) に射影し、
+    その線分からの残差と、白に近すぎる(alphaが小さい)ことへの罰則を
+    合わせてコスト化する。
+    """
+    work = roi.astype(np.float32)
+    target = np.array(target_rgb, dtype=np.float32)
+    white = np.full(3, 255.0, dtype=np.float32)
+
+    direction = target - white
+    denominator = float(np.dot(direction, direction))
+    if denominator <= 1e-9:
+        raise ValueError("局色が白と同一のため色コストを計算できません。")
+
+    alpha = np.sum((work - white) * direction, axis=2) / denominator
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    reconstructed = white + alpha[..., None] * direction
+    residual = np.max(np.abs(work - reconstructed), axis=2)
+
+    # 完全な白背景は residual=0 になってしまうため、
+    # alphaが小さいほど罰する。線の薄い縁は残しつつ背景は選びにくくする。
+    cost = residual + float(alpha_penalty) * (1.0 - alpha)
+    return cost.astype(np.float32), alpha.astype(np.float32)
+
+
+def _station_evidence_cost(
+    roi: np.ndarray,
+    station: str,
+    target_rgb: Tuple[int, int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    対象局のアンチエイリアス色コストと「他局より対象局らしいか」を統合する。
+
+    他局のアンチエイリアス色の方が説明力が高いピクセルには追加罰則を与える。
+    これによりNHKが青系局の薄い縁へ一瞬乗り移る事故を抑える。
+    """
+    own_cost, own_alpha = _antialias_color_cost(roi, target_rgb)
+
+    other_costs: list[np.ndarray] = []
+    for other_station, other_rgb in STATION_COLORS.items():
+        if other_station == station:
+            continue
+        other_cost, _ = _antialias_color_cost(roi, other_rgb)
+        other_costs.append(other_cost)
+
+    min_other = np.minimum.reduce(other_costs)
+
+    # 他局の方が低コストなら対象局候補として強く罰する。
+    # 3px相当の小さなマージンも入れ、ほぼ同程度の曖昧色も避ける。
+    ambiguity = np.maximum(0.0, own_cost - min_other + 3.0)
+    cost = own_cost + ambiguity * 4.0
+
+    if station == "NHK総合":
+        # NHKは本質的に無彩色。青/赤/桃のアンチエイリアス縁を
+        # RGB単純距離で灰色扱いしないよう、彩度に相当するspreadを罰する。
+        work = roi.astype(np.int16)
+        spread = (
+            work.max(axis=2) - work.min(axis=2)
+        ).astype(np.float32)
+
+        # 25まではNHKの描画揺れとして許し、それ以上を急速に罰する。
+        cost += np.maximum(0.0, spread - 25.0) * 1.6
+
+    return cost.astype(np.float32), own_alpha
+
 def _station_color_mask(
     roi: np.ndarray,
     station: str,
@@ -651,31 +730,45 @@ def _beam_trace_direction(
     return x_values, path_local
 
 def _refine_path(
-    raw_distance: np.ndarray,
+    evidence_cost: np.ndarray,
     path: np.ndarray,
-    tolerance: int,
+    *,
+    direct_threshold: float,
     radius: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    h, w = raw_distance.shape
+    """
+    DP経路の近傍から、対象局らしい実ピクセル群の中心へスナップする。
+
+    observed=True は単なるRGB近似ではなく、
+    アンチエイリアスと他局色の競合を考慮した evidence_cost が
+    十分低い場合だけ付ける。
+    """
+    h, w = evidence_cost.shape
     refined = path.astype(np.float32).copy()
     observed = np.zeros(w, dtype=bool)
 
-    search_radius = max(2, radius + 2)
+    search_radius = max(3, radius + 3)
     for x in range(w):
         center = int(round(float(path[x])))
         y0 = max(0, center - search_radius)
         y1 = min(h - 1, center + search_radius)
+
         rows = np.arange(y0, y1 + 1)
-        distances = raw_distance[y0:y1 + 1, x]
-        good = rows[distances <= tolerance]
+        costs = evidence_cost[y0:y1 + 1, x]
+        good = rows[costs <= direct_threshold]
 
         if len(good):
-            # 近傍の同色線の中心を使う。単発ノイズより線幅を優先。
             groups = _group_consecutive(good, max_gap=1)
-            chosen = min(
-                groups,
-                key=lambda group: abs(float(np.mean(group)) - float(path[x])),
-            )
+
+            def group_score(group: list[int]) -> float:
+                group_arr = np.array(group, dtype=int)
+                local_cost = float(np.mean(evidence_cost[group_arr, x]))
+                center_distance = abs(float(np.mean(group_arr)) - float(path[x]))
+                # 2～数pxの線幅を単発ノイズより少し優先する。
+                thickness_bonus = min(len(group), 6) * 0.35
+                return local_cost + center_distance * 1.5 - thickness_bonus
+
+            chosen = min(groups, key=group_score)
             refined[x] = float(np.mean(chosen))
             observed[x] = True
 
@@ -692,38 +785,85 @@ def _trace_station_global(
     tolerance: int,
     cursor_x: int | None = None,
     cursor_y: float | None = None,
+    grid_rows: list[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | str]]:
+    """
+    全幅を動的計画法で追跡する9.1方式。
+
+    9.0の単純RGB距離では、他局線のアンチエイリアス縁が対象局色へ近づき、
+    交差付近で一瞬だけ別局へ乗り移ることがあった。
+    9.1では「局色＋白背景」の混色モデルと他局色との相対比較を使う。
+    """
     x0 = max(0, int(trace_left))
     x1 = min(arr.shape[1] - 1, int(trace_right))
     roi = arr[graph_top:graph_bottom + 1, x0:x1 + 1]
 
-    raw_distance = _color_distance(roi, color)
-    line_radius = max(1, min(4, int(round((graph_bottom - graph_top + 1) / 400.0))))
-    local_distance = _vertical_local_min(raw_distance, line_radius)
+    evidence_cost, _ = _station_evidence_cost(
+        roi,
+        station,
+        color,
+    )
 
-    # 距離を二値化せずソフトコストとして使う。
-    emission = np.minimum(local_distance.astype(np.float32), 120.0)
+    line_radius = max(
+        1,
+        min(
+            4,
+            int(round((graph_bottom - graph_top + 1) / 400.0)),
+        ),
+    )
+    local_cost = _vertical_local_min(evidence_cost, line_radius)
 
-    anchor_tolerance = max(tolerance, 55 if station == "NHK総合" else tolerance)
+    # DP用コスト。極端な値はクリップして一部ノイズの影響を抑える。
+    emission = np.minimum(local_cost.astype(np.float32), 150.0)
+
+    # 「直接観測」とみなす閾値。
+    # toleranceは従来UIとの互換のため残すが、アンチエイリアスコストでは
+    # 42前後が十分緩い。過度に大きくしない。
+    direct_threshold = float(np.clip(tolerance, 24, 48))
+
     preferred_local_x = (x1 - x0) // 2
     suppressed_cursor_band: tuple[int, int] | None = None
 
-    # NHKだけは灰色カーソル自身がNHK色候補になり得る。
-    # カーソル中心のごく狭い帯を「色証拠なし」として扱い、
-    # 左右の実際のNHK線から経路を橋渡しする。
     if station == "NHK総合":
+        # 既知の水平グリッドはNHKと同じ無彩色なので強めに抑制する。
+        # 本物NHKが線上を横切る箇所は数pxだけ色証拠が弱くなるが、
+        # 前後の経路で自然に橋渡しできる。
+        if grid_rows:
+            grid_radius = max(2, int(round(arr.shape[0] * 0.0015)))
+            for global_y in grid_rows:
+                local_y = int(global_y - graph_top)
+                y0 = max(0, local_y - grid_radius)
+                y1 = min(emission.shape[0], local_y + grid_radius + 1)
+                if y0 < y1:
+                    emission[y0:y1, :] += 38.0
+
+        # 明るい中立灰色（UI/補助線）も追加で罰する。
         work = roi.astype(np.int16)
         brightness = work.mean(axis=2)
         spread = work.max(axis=2) - work.min(axis=2)
-        grid_like = (brightness > 210) & (spread <= 18)
-        emission += grid_like.astype(np.float32) * 12.0
+        ui_gray = (
+            (brightness > 215)
+            & (spread <= 18)
+        )
+        emission += ui_gray.astype(np.float32) * 24.0
 
+        # カーソルはNHK色に近い灰色実線なので、そのごく狭い帯を
+        # 色証拠なしとして左右から橋渡しする。
         if cursor_x is not None and x0 <= cursor_x <= x1:
             local_cursor_x = int(cursor_x - x0)
-            suppress_radius = max(4, int(round(arr.shape[1] * 0.0025)))
+            suppress_radius = max(
+                4,
+                int(round(arr.shape[1] * 0.0025)),
+            )
             band_left = max(0, local_cursor_x - suppress_radius)
-            band_right = min(emission.shape[1], local_cursor_x + suppress_radius + 1)
-            emission[:, band_left:band_right] = 70.0
+            band_right = min(
+                emission.shape[1],
+                local_cursor_x + suppress_radius + 1,
+            )
+            emission[:, band_left:band_right] = np.maximum(
+                emission[:, band_left:band_right],
+                85.0,
+            )
             suppressed_cursor_band = (band_left, band_right)
 
             if band_left <= preferred_local_x < band_right:
@@ -744,43 +884,51 @@ def _trace_station_global(
         anchor_used = "cursor"
     else:
         anchor_x, anchor_y = _choose_anchor_from_color(
-            local_distance,
+            local_cost,
             preferred_x=preferred_local_x,
-            tolerance=anchor_tolerance,
+            tolerance=int(round(direct_threshold)),
         )
 
-        # NHKのアンカーが抑制帯へ入った場合は、その外側から取り直す。
         if (
             suppressed_cursor_band is not None
             and suppressed_cursor_band[0] <= anchor_x < suppressed_cursor_band[1]
         ):
             retry_x = min(
                 emission.shape[1] - 1,
-                suppressed_cursor_band[1] + max(6, suppressed_cursor_band[1] - suppressed_cursor_band[0]),
+                suppressed_cursor_band[1]
+                + max(
+                    6,
+                    suppressed_cursor_band[1]
+                    - suppressed_cursor_band[0],
+                ),
             )
             anchor_x, anchor_y = _choose_anchor_from_color(
-                local_distance,
+                local_cost,
                 preferred_x=retry_x,
-                tolerance=anchor_tolerance,
+                tolerance=int(round(direct_threshold)),
             )
+
+    # NHKは色が他要素と競合しやすいので滑らかさを少し強くする。
+    smoothness = 0.62 if station == "NHK総合" else 0.50
+    beam_width = 32 if station == "NHK総合" else 24
 
     right_x, right_path = _beam_trace_direction(
         emission,
         anchor_x=anchor_x,
         anchor_y=anchor_y,
         direction=1,
-        beam_width=24,
-        smoothness=0.45,
-        anchor_strength=6.0,
+        beam_width=beam_width,
+        smoothness=smoothness,
+        anchor_strength=7.0,
     )
     left_x, left_path = _beam_trace_direction(
         emission,
         anchor_x=anchor_x,
         anchor_y=anchor_y,
         direction=-1,
-        beam_width=24,
-        smoothness=0.45,
-        anchor_strength=6.0,
+        beam_width=beam_width,
+        smoothness=smoothness,
+        anchor_strength=7.0,
     )
 
     path = np.full(x1 - x0 + 1, np.nan, dtype=np.float32)
@@ -791,21 +939,19 @@ def _trace_station_global(
         raise RuntimeError(f"{station}の全幅経路を復元できませんでした。")
 
     refined, observed = _refine_path(
-        raw_distance,
+        evidence_cost,
         path,
-        tolerance=anchor_tolerance,
+        direct_threshold=direct_threshold,
         radius=line_radius,
     )
 
-    # NHKカーソル帯は、灰色カーソルを「実測NHK」と誤認させない。
-    # DPが左右のNHK線から求めた経路をそのまま採用する。
+    # NHKカーソル帯は実測扱いしない。DP経路をそのまま使う。
     if suppressed_cursor_band is not None:
         band_left, band_right = suppressed_cursor_band
         refined[band_left:band_right] = path[band_left:band_right]
         observed[band_left:band_right] = False
 
-    # 非NHKの局色カーソル円は信頼できるため、中心を1点アンカーとして戻す。
-    # 従来のNHKのように十数pxを平坦化せず、カーソル直近3pxだけを固定する。
+    # 非NHKの色付きカーソル円は信頼できる観測なので中心を戻す。
     if (
         station != "NHK総合"
         and cursor_x is not None
@@ -821,18 +967,28 @@ def _trace_station_global(
     xs = np.arange(x0, x1 + 1)
     ys = refined + float(graph_top)
 
-    missing_groups = _group_consecutive(np.where(~observed)[0], max_gap=1)
-    max_gap_pixels = max((len(group) for group in missing_groups), default=0)
+    inferred_groups = _group_consecutive(
+        np.where(~observed)[0],
+        max_gap=1,
+    )
+    max_gap_pixels = max(
+        (len(group) for group in inferred_groups),
+        default=0,
+    )
     coverage = float(observed.mean())
 
-    quality = "A" if coverage >= 0.97 else ("B" if coverage >= 0.90 else "C")
+    quality = (
+        "A"
+        if coverage >= 0.97
+        else ("B" if coverage >= 0.90 else "C")
+    )
 
     diagnostics: dict[str, float | int | str] = {
         "coverage": coverage,
         "max_gap_pixels": int(max_gap_pixels),
         "rejected_jumps": 0,
         "quality": quality,
-        "tracking_method": "global-dp",
+        "tracking_method": "global-dp-antialias",
         "anchor": anchor_used,
         "inferred_pixels": int((~observed).sum()),
     }
@@ -922,6 +1078,7 @@ def analyze_image(
             tolerance,
             cursor_x=cursor_x,
             cursor_y=cursor_y,
+            grid_rows=grid,
         )
 
         gap_minutes = (
@@ -997,4 +1154,5 @@ def analyze_image(
         df[f"{station}_状態"] = station_status[station]
 
     return df, calibration, diagnostics
+
 
