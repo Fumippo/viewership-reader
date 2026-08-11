@@ -1,4 +1,5 @@
 
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -996,3 +997,4 @@ def analyze_image(
         df[f"{station}_状態"] = station_status[station]
 
     return df, calibration, diagnostics
+
