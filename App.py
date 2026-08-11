@@ -13,8 +13,8 @@ import streamlit as st
 from PIL import Image
 
 
-APP_VERSION = "8.1.0-regression-tested"
-EXPECTED_READER_VERSION = "8.1.0-regression-tested"
+APP_VERSION = "9.0.0-global-trace"
+EXPECTED_READER_VERSION = "9.0.0-global-trace"
 
 
 def load_reader_from_current_source():
@@ -30,7 +30,6 @@ def load_reader_from_current_source():
     source_hash = hashlib.sha256(source_bytes).hexdigest()[:12]
     module_name = f"viewership_reader_{source_hash}"
 
-    # 同じソースなら既存モジュールを再利用し、内容が変われば別名で必ず再読込。
     if module_name in sys.modules:
         return sys.modules[module_name], source_hash, reader_path
 
@@ -82,7 +81,7 @@ end_date = st.date_input(
 end_time_text = st.text_input(
     "画面下部「データ更新」の時刻",
     value=datetime.now().strftime("%H:%M"),
-    placeholder="例: 22:44",
+    placeholder="例: 20:51",
 )
 
 duration = st.number_input(
@@ -93,14 +92,27 @@ duration = st.number_input(
     step=1,
 )
 
+grid_percent_step = st.number_input(
+    "縦軸の1目盛り（%）",
+    min_value=0.5,
+    max_value=20.0,
+    value=2.0,
+    step=0.5,
+    help=(
+        "縦軸が 0, 2, 4, 6… なら 2、"
+        "0, 4, 8, 12… なら 4 を入力してください。"
+        "ここを間違えると全局の視聴率倍率がずれます。"
+    ),
+)
+
 tolerance = st.slider(
     "色検出の許容差",
     min_value=20,
-    max_value=55,
+    max_value=70,
     value=42,
     help=(
-        "低画質・圧縮画像に対応するため既定値を42にしています。"
-        "NHK灰色だけはグリッド誤認防止の専用条件を使います。"
+        "局色とのRGB差の許容範囲です。"
+        "9.0では二値判定だけでなく色距離を使う全幅経路追跡を行います。"
     ),
 )
 
@@ -131,7 +143,7 @@ if st.button("解析する", type="primary", use_container_width=True):
             "%H:%M",
         ).time()
     except ValueError:
-        st.error("時刻は22:44のように入力してください。")
+        st.error("時刻は20:51のように入力してください。")
         st.stop()
 
     end_dt = datetime.combine(end_date, parsed_time)
@@ -145,44 +157,58 @@ if st.button("解析する", type="primary", use_container_width=True):
             end_time=end_dt,
             duration_minutes=int(duration),
             tolerance=int(tolerance),
+            grid_percent_step=float(grid_percent_step),
         )
     except Exception as exc:
         st.error(
-            "グラフ本体を特定できなかったため解析できませんでした。"
-            "時刻線不足・追跡開始点・通常の色欠損だけでは停止しない版です。"
+            "解析できませんでした。"
+            "グラフ全体・0%線・少なくとも3本の水平グリッド線が"
+            "画像内に入っているか確認してください。"
         )
         st.exception(exc)
         st.stop()
 
-    st.success("解析完了。欠損がある場合も品質表示付きでCSVを出力します。")
+    st.success(
+        "解析完了。9.0では各局の線を全幅で経路探索し、"
+        "短い隠れやカーソル重なりを前後の線から復元します。"
+    )
 
     diagnostic_rows = []
     for station, values in diagnostics.items():
         diagnostic_rows.append(
             {
                 "局": station,
-                "検出率": values["coverage"] * 100,
+                "直接色検出率": float(values["coverage"]) * 100,
                 "品質": values.get("quality", "?"),
-                "最長欠損(分)": values.get("max_gap_minutes", 0.0),
-                "最長欠損(px)": values["max_gap_pixels"],
-                "除外した異常ジャンプ": values["rejected_jumps"],
+                "最長経路推定(分)": values.get("max_gap_minutes", 0.0),
+                "経路推定(px)": values.get("inferred_pixels", 0),
+                "追跡方式": values.get("tracking_method", "?"),
+                "アンカー": values.get("anchor", "?"),
             }
         )
     diagnostic_df = pd.DataFrame(diagnostic_rows)
 
     quality_values = set(diagnostic_df["品質"].astype(str))
     if "C" in quality_values:
+        bad_stations = diagnostic_df.loc[
+            diagnostic_df["品質"].eq("C"), "局"
+        ].tolist()
         st.warning(
-            "品質Cの局があります。CSVは出力しますが、長い欠損区間は補間値です。"
+            "品質Cの局があります: "
+            + "、".join(bad_stations)
+            + "。数値は出力しますが、色証拠が薄い区間では"
+            "全幅経路推定の比重が高くなっています。"
         )
     elif "B" in quality_values:
         st.info(
-            "品質Bの局があります。CSVは出力します。最長欠損区間は診断表を確認してください。"
+            "品質Bの局があります。"
+            "数値は出力しますが、診断表の最長経路推定区間を確認してください。"
         )
 
     if calibration.time_axis_method != "hour-lines":
-        st.info(
-            "正時線が不足または不規則だったため、6局の色線範囲から時間軸を復元しました。"
+        st.warning(
+            "正時線から時間軸を確定できなかったため、"
+            "6局の色線範囲から時間軸を復元しました。"
         )
 
     with st.expander("自動較正・品質診断", expanded=True):
@@ -194,9 +220,13 @@ if st.button("解析する", type="primary", use_container_width=True):
                 "時間軸右端": round(calibration.graph_right, 1),
                 "グラフ上端": round(calibration.graph_top, 1),
                 "0%線": round(calibration.y_zero, 1),
+                "縦軸1目盛り(%)": calibration.grid_percent_step,
+                "水平グリッド間隔(px)": round(
+                    calibration.grid_gap_pixels, 2
+                ),
                 "1%あたりpx": round(
                     calibration.pixels_per_percent,
-                    2,
+                    3,
                 ),
                 "1分あたりpx": round(
                     calibration.pixels_per_minute,
@@ -209,8 +239,8 @@ if st.button("解析する", type="primary", use_container_width=True):
         st.dataframe(
             diagnostic_df.style.format(
                 {
-                    "検出率": "{:.1f}%",
-                    "最長欠損(分)": "{:.2f}",
+                    "直接色検出率": "{:.1f}%",
+                    "最長経路推定(分)": "{:.2f}",
                 }
             ),
             use_container_width=True,
