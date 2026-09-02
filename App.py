@@ -75,12 +75,12 @@ uploaded = st.file_uploader(
 
 end_date = st.date_input(
     "画面下部「データ更新」の日付",
-    value=datetime.now().date(),
+    value=None,
 )
 
 end_time_text = st.text_input(
     "画面下部「データ更新」の時刻",
-    value=datetime.now().strftime("%H:%M"),
+    value="",
     placeholder="例: 20:51",
 )
 
