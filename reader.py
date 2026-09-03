@@ -8,7 +8,9 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
+
 READER_VERSION = "9.1.0-antialias-trace"
+
 
 STATION_COLORS: Dict[str, Tuple[int, int, int]] = {
     "NHK総合": (182, 188, 195),
@@ -18,6 +20,7 @@ STATION_COLORS: Dict[str, Tuple[int, int, int]] = {
     "テレビ東京": (89, 113, 175),
     "フジテレビ": (243, 124, 124),
 }
+
 
 @dataclass(frozen=True)
 class Calibration:
@@ -36,15 +39,26 @@ class Calibration:
     time_axis_method: str = "unknown"
     time_line_inliers: int = 0
 
-def _group_consecutive(values: np.ndarray | list[int], max_gap: int = 1) -> list[list[int]]:
+
+def _group_consecutive(
+    values: np.ndarray | list[int],
+    max_gap: int = 1,
+) -> list[list[int]]:
     groups: list[list[int]] = []
+
     for raw in values:
         value = int(raw)
-        if not groups or value - groups[-1][-1] > max_gap:
+
+        if (
+            not groups
+            or value - groups[-1][-1] > max_gap
+        ):
             groups.append([value])
         else:
             groups[-1].append(value)
+
     return groups
+
 
 def _neutral_gray_mask(
     pixels: np.ndarray,
@@ -54,121 +68,254 @@ def _neutral_gray_mask(
     max_brightness: float,
 ) -> np.ndarray:
     work = pixels.astype(np.int16)
-    spread = work.max(axis=2) - work.min(axis=2)
+
+    spread = (
+        work.max(axis=2)
+        - work.min(axis=2)
+    )
+
     brightness = work.mean(axis=2)
+
     return (
         (spread <= max_spread)
         & (brightness >= min_brightness)
         & (brightness <= max_brightness)
     )
 
-def _find_thin_horizontal_lines(arr: np.ndarray) -> list[int]:
+
+def _find_thin_horizontal_lines(
+    arr: np.ndarray,
+) -> list[int]:
     h, w, _ = arr.shape
+
     x0 = int(w * 0.08)
     x1 = int(w * 0.95)
 
     crop = arr[:, x0:x1]
+
     mask = _neutral_gray_mask(
         crop,
         max_spread=20,
         min_brightness=195,
         max_brightness=253,
     )
+
     row_score = mask.mean(axis=1)
 
-    candidates = np.where(row_score >= 0.65)[0]
-    groups = _group_consecutive(candidates, max_gap=1)
+    candidates = np.where(
+        row_score >= 0.65
+    )[0]
+
+    groups = _group_consecutive(
+        candidates,
+        max_gap=1,
+    )
 
     thin_lines = [
         int(round(np.mean(group)))
         for group in groups
-        if 1 <= len(group) <= 4
-        and int(h * 0.18) <= int(round(np.mean(group))) <= int(h * 0.99)
+        if (
+            1 <= len(group) <= 4
+            and int(h * 0.18)
+            <= int(round(np.mean(group)))
+            <= int(h * 0.99)
+        )
     ]
 
-    # TVALは低視聴率帯で0,2,4の3本だけになることがある。
+    # TVALは低視聴率帯で
+    # 0, 2, 4 の3本だけになることがある。
     if len(thin_lines) < 3:
         raise RuntimeError(
             "水平グリッド線を3本以上検出できませんでした。"
             "グラフ全体と0%線が入った画像を使ってください。"
         )
+
     return thin_lines
+
 
 def _select_regular_grid(
     lines: list[int],
     image_height: int,
     min_lines: int = 3,
 ) -> tuple[list[int], float]:
-    ys = np.array(sorted(set(lines)), dtype=float)
-    if len(ys) < min_lines:
-        raise RuntimeError("水平グリッド線が不足しています。")
+    ys = np.array(
+        sorted(set(lines)),
+        dtype=float,
+    )
 
-    # 固定45～220pxを廃止し、画像高さに比例させる。
-    min_gap = max(20.0, image_height * 0.015)
-    max_gap = max(min_gap + 1.0, image_height * 0.45)
+    if len(ys) < min_lines:
+        raise RuntimeError(
+            "水平グリッド線が不足しています。"
+        )
+
+    min_gap = max(
+        20.0,
+        image_height * 0.015,
+    )
+
+    max_gap = max(
+        min_gap + 1.0,
+        image_height * 0.45,
+    )
 
     gap_candidates: list[float] = []
+
     for i in range(len(ys)):
         for j in range(i + 1, len(ys)):
             difference = ys[j] - ys[i]
+
             for steps in range(1, 13):
                 gap = difference / steps
+
                 if min_gap <= gap <= max_gap:
-                    gap_candidates.append(float(gap))
+                    gap_candidates.append(
+                        float(gap)
+                    )
 
     best_score = -1e18
     best_values: list[float] | None = None
 
     for gap in gap_candidates:
-        tolerance = max(3.0, gap * 0.035)
+        tolerance = max(
+            3.0,
+            gap * 0.035,
+        )
 
         for anchor in ys:
-            step_numbers = np.round((ys - anchor) / gap)
-            residuals = np.abs(ys - (anchor + step_numbers * gap))
-            matched_steps = np.unique(
-                step_numbers[residuals <= tolerance].astype(int)
+            step_numbers = np.round(
+                (ys - anchor) / gap
             )
+
+            residuals = np.abs(
+                ys
+                - (
+                    anchor
+                    + step_numbers * gap
+                )
+            )
+
+            matched_steps = np.unique(
+                step_numbers[
+                    residuals <= tolerance
+                ].astype(int)
+            )
+
             if len(matched_steps) < min_lines:
                 continue
 
-            step_groups = _group_consecutive(matched_steps, max_gap=1)
-            longest_steps = max(step_groups, key=len)
+            step_groups = _group_consecutive(
+                matched_steps,
+                max_gap=1,
+            )
+
+            longest_steps = max(
+                step_groups,
+                key=len,
+            )
+
             if len(longest_steps) < min_lines:
                 continue
 
             values: list[float] = []
             residual_sum = 0.0
-            for step in longest_steps:
-                target = anchor + step * gap
-                index = int(np.argmin(np.abs(ys - target)))
-                values.append(float(ys[index]))
-                residual_sum += abs(float(ys[index]) - target)
 
-            span = max(values) - min(values)
-            score = len(values) * 1000.0 + span - residual_sum * 10.0
+            for step in longest_steps:
+                target = (
+                    anchor
+                    + step * gap
+                )
+
+                index = int(
+                    np.argmin(
+                        np.abs(
+                            ys - target
+                        )
+                    )
+                )
+
+                values.append(
+                    float(ys[index])
+                )
+
+                residual_sum += abs(
+                    float(ys[index])
+                    - target
+                )
+
+            span = (
+                max(values)
+                - min(values)
+            )
+
+            score = (
+                len(values) * 1000.0
+                + span
+                - residual_sum * 10.0
+            )
 
             if score > best_score:
                 best_score = score
                 best_values = values
 
-    if best_values is None or len(best_values) < min_lines:
-        raise RuntimeError("規則的な水平グリッドを特定できませんでした。")
+    if (
+        best_values is None
+        or len(best_values) < min_lines
+    ):
+        raise RuntimeError(
+            "規則的な水平グリッドを特定できませんでした。"
+        )
 
-    grid = sorted(set(int(round(value)) for value in best_values))
-    gap = float(np.median(np.diff(grid)))
+    grid = sorted(
+        set(
+            int(round(value))
+            for value in best_values
+        )
+    )
 
-    if np.max(np.abs(np.diff(grid) - gap)) > max(4.0, gap * 0.06):
-        raise RuntimeError("水平グリッドの間隔が不規則です。")
+    gap = float(
+        np.median(
+            np.diff(grid)
+        )
+    )
+
+    if (
+        np.max(
+            np.abs(
+                np.diff(grid)
+                - gap
+            )
+        )
+        > max(
+            4.0,
+            gap * 0.06,
+        )
+    ):
+        raise RuntimeError(
+            "水平グリッドの間隔が不規則です。"
+        )
 
     return grid, gap
 
-def _find_rough_graph_x_bounds(arr: np.ndarray, grid: list[int]) -> tuple[int, int]:
+
+def _find_rough_graph_x_bounds(
+    arr: np.ndarray,
+    grid: list[int],
+) -> tuple[int, int]:
     h, w, _ = arr.shape
-    spans: list[tuple[int, int]] = []
-    rows_to_use = grid[: min(3, len(grid))]
+
+    spans: list[
+        tuple[int, int]
+    ] = []
+
+    rows_to_use = grid[
+        : min(3, len(grid))
+    ]
 
     for y in rows_to_use:
-        row = arr[y:y + 1]
+        row = arr[
+            y:y + 1
+        ]
+
         mask = _neutral_gray_mask(
             row,
             max_spread=25,
@@ -177,33 +324,84 @@ def _find_rough_graph_x_bounds(arr: np.ndarray, grid: list[int]) -> tuple[int, i
         )[0]
 
         xs = np.where(mask)[0]
+
         if len(xs) == 0:
             continue
 
-        groups = _group_consecutive(xs, max_gap=max(6, int(w * 0.008)))
+        groups = _group_consecutive(
+            xs,
+            max_gap=max(
+                6,
+                int(w * 0.008),
+            ),
+        )
+
         long_groups = [
-            group for group in groups
-            if group[-1] - group[0] + 1 >= max(80, int(w * 0.05))
+            group
+            for group in groups
+            if (
+                group[-1]
+                - group[0]
+                + 1
+                >= max(
+                    80,
+                    int(w * 0.05),
+                )
+            )
         ]
+
         if not long_groups:
             continue
 
-        left = min(group[0] for group in long_groups)
-        right = max(group[-1] for group in long_groups)
+        left = min(
+            group[0]
+            for group in long_groups
+        )
+
+        right = max(
+            group[-1]
+            for group in long_groups
+        )
 
         if right - left >= w * 0.55:
-            spans.append((left, right))
+            spans.append(
+                (left, right)
+            )
 
     if not spans:
-        raise RuntimeError("グラフ左右端を検出できませんでした。")
+        raise RuntimeError(
+            "グラフ左右端を検出できませんでした。"
+        )
 
-    left = int(round(np.median([span[0] for span in spans])))
-    right = int(round(np.median([span[1] for span in spans])))
+    left = int(
+        round(
+            np.median(
+                [
+                    span[0]
+                    for span in spans
+                ]
+            )
+        )
+    )
+
+    right = int(
+        round(
+            np.median(
+                [
+                    span[1]
+                    for span in spans
+                ]
+            )
+        )
+    )
 
     if right - left < w * 0.55:
-        raise RuntimeError("検出したグラフ幅が狭すぎます。")
+        raise RuntimeError(
+            "検出したグラフ幅が狭すぎます。"
+        )
 
     return left, right
+
 
 def _find_vertical_hour_lines(
     arr: np.ndarray,
@@ -212,34 +410,98 @@ def _find_vertical_hour_lines(
     rough_left: int,
     rough_right: int,
 ) -> list[int]:
-    roi = arr[graph_top:graph_bottom + 1]
+    roi = arr[
+        graph_top:graph_bottom + 1
+    ]
+
     mask = _neutral_gray_mask(
         roi,
         max_spread=20,
         min_brightness=195,
         max_brightness=253,
     )
-    column_score = mask.mean(axis=0)
+
+    column_score = mask.mean(
+        axis=0
+    )
 
     w = arr.shape[1]
-    search_left = max(0, rough_left - max(30, int(w * 0.03)))
-    search_right = min(w - 1, int(w * 0.98))
-    nms_distance = max(10, int(w * 0.008))
 
-    candidates: list[tuple[int, float]] = []
-    for x in range(max(1, search_left), min(len(column_score) - 2, search_right) + 1):
-        score = float(column_score[x])
-        if not (0.30 <= score <= 0.79):
+    search_left = max(
+        0,
+        rough_left
+        - max(
+            30,
+            int(w * 0.03),
+        ),
+    )
+
+    search_right = min(
+        w - 1,
+        int(w * 0.98),
+    )
+
+    nms_distance = max(
+        10,
+        int(w * 0.008),
+    )
+
+    candidates: list[
+        tuple[int, float]
+    ] = []
+
+    for x in range(
+        max(
+            1,
+            search_left,
+        ),
+        min(
+            len(column_score) - 2,
+            search_right,
+        ) + 1,
+    ):
+        score = float(
+            column_score[x]
+        )
+
+        if not (
+            0.30 <= score <= 0.79
+        ):
             continue
-        if score >= column_score[x - 1] and score >= column_score[x + 1]:
-            candidates.append((x, score))
 
-    selected: list[tuple[int, float]] = []
-    for x, score in sorted(candidates, key=lambda item: item[1], reverse=True):
-        if all(abs(x - old_x) > nms_distance for old_x, _ in selected):
-            selected.append((x, score))
+        if (
+            score
+            >= column_score[x - 1]
+            and score
+            >= column_score[x + 1]
+        ):
+            candidates.append(
+                (x, score)
+            )
 
-    return sorted(x for x, _ in selected)
+    selected: list[
+        tuple[int, float]
+    ] = []
+
+    for x, score in sorted(
+        candidates,
+        key=lambda item: item[1],
+        reverse=True,
+    ):
+        if all(
+            abs(x - old_x)
+            > nms_distance
+            for old_x, _ in selected
+        ):
+            selected.append(
+                (x, score)
+            )
+
+    return sorted(
+        x
+        for x, _ in selected
+    )
+
 
 def _match_time_axis_model(
     peaks: list[int],
@@ -248,232 +510,722 @@ def _match_time_axis_model(
     rough_right: int,
     duration_minutes: int,
     image_width: int,
-) -> tuple[float, float, float, list[tuple[int, float]], list[int]]:
+) -> tuple[
+    float,
+    float,
+    float,
+    list[tuple[int, float]],
+    list[int],
+]:
     if len(peaks) < 2:
-        raise RuntimeError("縦の時刻目盛りを2本以上検出できませんでした。")
+        raise RuntimeError(
+            "縦の時刻目盛りを2本以上検出できませんでした。"
+        )
+
     if len(expected_offsets) < 2:
-        raise RuntimeError("表示期間内の正時候補が不足しています。")
+        raise RuntimeError(
+            "表示期間内の正時候補が不足しています。"
+        )
 
-    rough_ppm = (rough_right - rough_left) / float(duration_minutes)
-    rough_hour_spacing = rough_ppm * 60.0
+    rough_ppm = (
+        rough_right
+        - rough_left
+    ) / float(
+        duration_minutes
+    )
 
-    max_hour_steps = max(1, int(np.ceil(duration_minutes / 60.0)))
-    spacing_candidates: list[float] = [rough_hour_spacing]
+    rough_hour_spacing = (
+        rough_ppm * 60.0
+    )
 
-    min_peak_difference = max(60.0, image_width * 0.04)
-    for i in range(len(peaks)):
-        for j in range(i + 1, len(peaks)):
-            difference = float(peaks[j] - peaks[i])
-            if difference < min_peak_difference:
+    max_hour_steps = max(
+        1,
+        int(
+            np.ceil(
+                duration_minutes
+                / 60.0
+            )
+        ),
+    )
+
+    spacing_candidates: list[
+        float
+    ] = [
+        rough_hour_spacing
+    ]
+
+    min_peak_difference = max(
+        60.0,
+        image_width * 0.04,
+    )
+
+    for i in range(
+        len(peaks)
+    ):
+        for j in range(
+            i + 1,
+            len(peaks),
+        ):
+            difference = float(
+                peaks[j]
+                - peaks[i]
+            )
+
+            if (
+                difference
+                < min_peak_difference
+            ):
                 continue
-            for hour_steps in range(1, max_hour_steps + 1):
-                spacing = difference / hour_steps
-                if rough_hour_spacing * 0.55 <= spacing <= rough_hour_spacing * 1.45:
-                    spacing_candidates.append(spacing)
 
-    best: dict[str, object] | None = None
+            for hour_steps in range(
+                1,
+                max_hour_steps + 1,
+            ):
+                spacing = (
+                    difference
+                    / hour_steps
+                )
+
+                if (
+                    rough_hour_spacing * 0.55
+                    <= spacing
+                    <= rough_hour_spacing * 1.45
+                ):
+                    spacing_candidates.append(
+                        spacing
+                    )
+
+    best: dict[
+        str,
+        object,
+    ] | None = None
 
     for hour_spacing in spacing_candidates:
-        ppm = hour_spacing / 60.0
-        tolerance = max(7.0, hour_spacing * 0.035)
+        ppm = (
+            hour_spacing
+            / 60.0
+        )
+
+        tolerance = max(
+            7.0,
+            hour_spacing * 0.035,
+        )
 
         for peak in peaks:
             for offset in expected_offsets:
-                candidate_start = float(peak) - float(offset) * ppm
+                candidate_start = (
+                    float(peak)
+                    - float(offset) * ppm
+                )
+
                 predicted = np.array(
-                    [candidate_start + expected * ppm for expected in expected_offsets],
+                    [
+                        candidate_start
+                        + expected * ppm
+                        for expected
+                        in expected_offsets
+                    ],
                     dtype=float,
                 )
 
-                pairs: list[tuple[float, int, int, float]] = []
-                for pred_index, predicted_x in enumerate(predicted):
-                    for peak_index, detected_x in enumerate(peaks):
-                        distance = abs(float(detected_x) - float(predicted_x))
-                        if distance <= tolerance:
+                pairs: list[
+                    tuple[
+                        float,
+                        int,
+                        int,
+                        float,
+                    ]
+                ] = []
+
+                for (
+                    pred_index,
+                    predicted_x,
+                ) in enumerate(predicted):
+                    for (
+                        peak_index,
+                        detected_x,
+                    ) in enumerate(peaks):
+                        distance = abs(
+                            float(detected_x)
+                            - float(predicted_x)
+                        )
+
+                        if (
+                            distance
+                            <= tolerance
+                        ):
                             pairs.append(
-                                (distance, pred_index, peak_index, float(detected_x))
+                                (
+                                    distance,
+                                    pred_index,
+                                    peak_index,
+                                    float(
+                                        detected_x
+                                    ),
+                                )
                             )
 
-                pairs.sort(key=lambda item: item[0])
-                used_pred: set[int] = set()
-                used_peak: set[int] = set()
-                matches: list[tuple[int, float]] = []
+                pairs.sort(
+                    key=lambda item: item[0]
+                )
+
+                used_pred: set[
+                    int
+                ] = set()
+
+                used_peak: set[
+                    int
+                ] = set()
+
+                matches: list[
+                    tuple[int, float]
+                ] = []
+
                 residual_sum = 0.0
 
-                for distance, pred_index, peak_index, detected_x in pairs:
-                    if pred_index in used_pred or peak_index in used_peak:
+                for (
+                    distance,
+                    pred_index,
+                    peak_index,
+                    detected_x,
+                ) in pairs:
+                    if (
+                        pred_index
+                        in used_pred
+                        or peak_index
+                        in used_peak
+                    ):
                         continue
-                    used_pred.add(pred_index)
-                    used_peak.add(peak_index)
-                    matches.append((expected_offsets[pred_index], detected_x))
-                    residual_sum += distance
+
+                    used_pred.add(
+                        pred_index
+                    )
+
+                    used_peak.add(
+                        peak_index
+                    )
+
+                    matches.append(
+                        (
+                            expected_offsets[
+                                pred_index
+                            ],
+                            detected_x,
+                        )
+                    )
+
+                    residual_sum += (
+                        distance
+                    )
 
                 if len(matches) < 2:
                     continue
 
-                candidate_end = candidate_start + duration_minutes * ppm
-                boundary_penalty = (
-                    abs(candidate_start - rough_left)
-                    + abs(candidate_end - rough_right)
+                candidate_end = (
+                    candidate_start
+                    + duration_minutes
+                    * ppm
                 )
-                spacing_penalty = abs(ppm - rough_ppm) * 60.0
+
+                boundary_penalty = (
+                    abs(
+                        candidate_start
+                        - rough_left
+                    )
+                    + abs(
+                        candidate_end
+                        - rough_right
+                    )
+                )
+
+                spacing_penalty = (
+                    abs(
+                        ppm
+                        - rough_ppm
+                    )
+                    * 60.0
+                )
 
                 score = (
-                    len(matches) * 100000.0
-                    - residual_sum * 100.0
-                    - boundary_penalty * 2.0
-                    - spacing_penalty * 10.0
+                    len(matches)
+                    * 100000.0
+                    - residual_sum
+                    * 100.0
+                    - boundary_penalty
+                    * 2.0
+                    - spacing_penalty
+                    * 10.0
                 )
 
-                if candidate_start < -40 or candidate_end > image_width + 40:
+                if (
+                    candidate_start < -40
+                    or candidate_end
+                    > image_width + 40
+                ):
                     score -= 100000.0
 
-                if best is None or score > float(best["score"]):
+                if (
+                    best is None
+                    or score
+                    > float(
+                        best["score"]
+                    )
+                ):
                     best = {
                         "score": score,
                         "matches": matches,
-                        "start": candidate_start,
+                        "start": (
+                            candidate_start
+                        ),
                         "ppm": ppm,
                     }
 
     if best is None:
-        raise RuntimeError("縦の時刻目盛りから時間軸を較正できませんでした。")
-
-    matches = list(best["matches"])  # type: ignore[arg-type]
-    offsets = np.array([pair[0] for pair in matches], dtype=float)
-    detected = np.array([pair[1] for pair in matches], dtype=float)
-    design = np.column_stack([np.ones(len(offsets)), offsets])
-    start_x, pixels_per_minute = np.linalg.lstsq(
-        design, detected, rcond=None
-    )[0]
-    start_x = float(start_x)
-    pixels_per_minute = float(pixels_per_minute)
-    end_x = start_x + duration_minutes * pixels_per_minute
-
-    predicted_matches = start_x + offsets * pixels_per_minute
-    residuals = np.abs(predicted_matches - detected)
-    hour_spacing = pixels_per_minute * 60.0
-    allowed_residual = max(8.0, hour_spacing * 0.04)
-
-    if float(np.max(residuals)) > allowed_residual:
         raise RuntimeError(
-            "正時線の対応後も残差が大きく、安全に時間軸を確定できませんでした。"
+            "縦の時刻目盛りから時間軸を較正できませんでした。"
         )
 
-    allowed_boundary = max(50.0, rough_hour_spacing * 0.22)
+    matches = list(
+        best["matches"]  # type: ignore[arg-type]
+    )
+
+    offsets = np.array(
+        [
+            pair[0]
+            for pair in matches
+        ],
+        dtype=float,
+    )
+
+    detected = np.array(
+        [
+            pair[1]
+            for pair in matches
+        ],
+        dtype=float,
+    )
+
+    design = np.column_stack(
+        [
+            np.ones(
+                len(offsets)
+            ),
+            offsets,
+        ]
+    )
+
+    (
+        start_x,
+        pixels_per_minute,
+    ) = np.linalg.lstsq(
+        design,
+        detected,
+        rcond=None,
+    )[0]
+
+    start_x = float(
+        start_x
+    )
+
+    pixels_per_minute = float(
+        pixels_per_minute
+    )
+
+    end_x = (
+        start_x
+        + duration_minutes
+        * pixels_per_minute
+    )
+
+    predicted_matches = (
+        start_x
+        + offsets
+        * pixels_per_minute
+    )
+
+    residuals = np.abs(
+        predicted_matches
+        - detected
+    )
+
+    hour_spacing = (
+        pixels_per_minute
+        * 60.0
+    )
+
+    allowed_residual = max(
+        8.0,
+        hour_spacing * 0.04,
+    )
+
     if (
-        start_x < rough_left - allowed_boundary
-        or end_x > rough_right + allowed_boundary
+        float(
+            np.max(residuals)
+        )
+        > allowed_residual
     ):
-        raise RuntimeError("推定した時間軸がグラフ領域から大きく外れています。")
+        raise RuntimeError(
+            "正時線の対応後も残差が大きく、"
+            "安全に時間軸を確定できませんでした。"
+        )
 
-    matched_peak_values = {int(round(pair[1])) for pair in matches}
-    outliers = [peak for peak in peaks if peak not in matched_peak_values]
+    allowed_boundary = max(
+        50.0,
+        rough_hour_spacing * 0.22,
+    )
 
-    return start_x, end_x, pixels_per_minute, matches, outliers
+    if (
+        start_x
+        < rough_left
+        - allowed_boundary
+        or end_x
+        > rough_right
+        + allowed_boundary
+    ):
+        raise RuntimeError(
+            "推定した時間軸がグラフ領域から大きく外れています。"
+        )
 
-def _color_distance(roi: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
-    work = roi.astype(np.int16)
-    target = np.array(target_rgb, dtype=np.int16)
-    return np.max(np.abs(work - target), axis=2)
+    matched_peak_values = {
+        int(
+            round(
+                pair[1]
+            )
+        )
+        for pair in matches
+    }
+
+    outliers = [
+        peak
+        for peak in peaks
+        if peak
+        not in matched_peak_values
+    ]
+
+    return (
+        start_x,
+        end_x,
+        pixels_per_minute,
+        matches,
+        outliers,
+    )
 
 
-def _antialias_color_cost(
+def _color_distance(
     roi: np.ndarray,
-    target_rgb: Tuple[int, int, int],
+    target_rgb: Tuple[
+        int,
+        int,
+        int,
+    ],
+) -> np.ndarray:
+    work = roi.astype(
+        np.int16
+    )
+
+    target = np.array(
+        target_rgb,
+        dtype=np.int16,
+    )
+
+    return np.max(
+        np.abs(
+            work - target
+        ),
+        axis=2,
+    )
+
+
+def _precompute_station_evidence_costs(
+    roi: np.ndarray,
     *,
     alpha_penalty: float = 35.0,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """
-    「局色そのもの」だけでなく「局色と白背景の混色」も同じ色線として評価する。
+    6局すべての色証拠コストを一括計算する。
 
-    ブラウザ描画では線の縁がアンチエイリアスされ、
-    target と白(255,255,255)の中間色になる。
-    単純なRGB距離だけだと、特にテレビ東京などの青線の薄い縁が
-    NHKの灰色へ近づき誤追跡の原因になる。
+    旧方式では1局を解析するたびに
+    自局＋他5局のAA色コストを再計算していたため、
 
-    各ピクセルを white + alpha * (target - white) に射影し、
-    その線分からの残差と、白に近すぎる(alphaが小さい)ことへの罰則を
-    合わせてコスト化する。
+        6局 × 6色 = 36回
+
+    の全面色計算が発生していた。
+
+    ここでは各局色を最初に1回ずつだけ計算するため、
+
+        6色 = 6回
+
+    まで削減する。
+
+    アンチエイリアスモデル、
+    他局との競合ペナルティ、
+    NHKの彩度ペナルティは旧方式と同じ。
     """
-    work = roi.astype(np.float32)
-    target = np.array(target_rgb, dtype=np.float32)
-    white = np.full(3, 255.0, dtype=np.float32)
 
-    direction = target - white
-    denominator = float(np.dot(direction, direction))
-    if denominator <= 1e-9:
-        raise ValueError("局色が白と同一のため色コストを計算できません。")
+    work = roi.astype(
+        np.float32
+    )
 
-    alpha = np.sum((work - white) * direction, axis=2) / denominator
-    alpha = np.clip(alpha, 0.0, 1.0)
+    white = np.full(
+        3,
+        255.0,
+        dtype=np.float32,
+    )
 
-    reconstructed = white + alpha[..., None] * direction
-    residual = np.max(np.abs(work - reconstructed), axis=2)
+    stations = list(
+        STATION_COLORS
+    )
 
-    # 完全な白背景は residual=0 になってしまうため、
-    # alphaが小さいほど罰する。線の薄い縁は残しつつ背景は選びにくくする。
-    cost = residual + float(alpha_penalty) * (1.0 - alpha)
-    return cost.astype(np.float32), alpha.astype(np.float32)
+    base_costs: dict[
+        str,
+        np.ndarray,
+    ] = {}
 
+    # -----------------------------------------
+    # 各局色のアンチエイリアスコストを
+    # 1回ずつだけ計算
+    # -----------------------------------------
 
-def _station_evidence_cost(
-    roi: np.ndarray,
-    station: str,
-    target_rgb: Tuple[int, int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    対象局のアンチエイリアス色コストと「他局より対象局らしいか」を統合する。
+    for (
+        station,
+        target_rgb,
+    ) in STATION_COLORS.items():
+        target = np.array(
+            target_rgb,
+            dtype=np.float32,
+        )
 
-    他局のアンチエイリアス色の方が説明力が高いピクセルには追加罰則を与える。
-    これによりNHKが青系局の薄い縁へ一瞬乗り移る事故を抑える。
-    """
-    own_cost, own_alpha = _antialias_color_cost(roi, target_rgb)
+        direction = (
+            target
+            - white
+        )
 
-    other_costs: list[np.ndarray] = []
-    for other_station, other_rgb in STATION_COLORS.items():
-        if other_station == station:
-            continue
-        other_cost, _ = _antialias_color_cost(roi, other_rgb)
-        other_costs.append(other_cost)
+        denominator = float(
+            np.dot(
+                direction,
+                direction,
+            )
+        )
 
-    min_other = np.minimum.reduce(other_costs)
+        if denominator <= 1e-9:
+            raise ValueError(
+                f"{station}の局色が白と同一のため"
+                "色コストを計算できません。"
+            )
 
-    # 他局の方が低コストなら対象局候補として強く罰する。
-    # 3px相当の小さなマージンも入れ、ほぼ同程度の曖昧色も避ける。
-    ambiguity = np.maximum(0.0, own_cost - min_other + 3.0)
-    cost = own_cost + ambiguity * 4.0
+        alpha = (
+            np.sum(
+                (
+                    work
+                    - white
+                )
+                * direction,
+                axis=2,
+            )
+            / denominator
+        )
 
-    if station == "NHK総合":
-        # NHKは本質的に無彩色。青/赤/桃のアンチエイリアス縁を
-        # RGB単純距離で灰色扱いしないよう、彩度に相当するspreadを罰する。
-        work = roi.astype(np.int16)
-        spread = (
-            work.max(axis=2) - work.min(axis=2)
-        ).astype(np.float32)
+        alpha = np.clip(
+            alpha,
+            0.0,
+            1.0,
+        )
 
-        # 25まではNHKの描画揺れとして許し、それ以上を急速に罰する。
-        cost += np.maximum(0.0, spread - 25.0) * 1.6
+        reconstructed = (
+            white
+            + alpha[..., None]
+            * direction
+        )
 
-    return cost.astype(np.float32), own_alpha
+        residual = np.max(
+            np.abs(
+                work
+                - reconstructed
+            ),
+            axis=2,
+        )
+
+        cost = (
+            residual
+            + float(
+                alpha_penalty
+            )
+            * (
+                1.0
+                - alpha
+            )
+        )
+
+        base_costs[
+            station
+        ] = cost.astype(
+            np.float32,
+            copy=False,
+        )
+
+    # -----------------------------------------
+    # 6局のコストを積む
+    #
+    # shape:
+    # (6, H, W)
+    # -----------------------------------------
+
+    cost_stack = np.stack(
+        [
+            base_costs[
+                station
+            ]
+            for station
+            in stations
+        ],
+        axis=0,
+    )
+
+    # 各ピクセルについて
+    # 最小値と2番目の最小値を一括取得
+    partitioned = np.partition(
+        cost_stack,
+        kth=1,
+        axis=0,
+    )
+
+    smallest = partitioned[0]
+    second_smallest = (
+        partitioned[1]
+    )
+
+    argmin_station = np.argmin(
+        cost_stack,
+        axis=0,
+    )
+
+    # NHK用spreadも
+    # 全局処理中に何度も作らず1回だけ
+    work_i16 = roi.astype(
+        np.int16
+    )
+
+    spread = (
+        work_i16.max(axis=2)
+        - work_i16.min(axis=2)
+    ).astype(
+        np.float32
+    )
+
+    evidence_costs: dict[
+        str,
+        np.ndarray,
+    ] = {}
+
+    for (
+        station_index,
+        station,
+    ) in enumerate(stations):
+        own_cost = base_costs[
+            station
+        ]
+
+        # 自局が最小だったピクセルでは、
+        # 他局最小値は2番目の値。
+        #
+        # 自局が最小でなければ
+        # 全局最小値がそのまま他局最小値。
+        min_other = np.where(
+            argmin_station
+            == station_index,
+            second_smallest,
+            smallest,
+        )
+
+        ambiguity = np.maximum(
+            0.0,
+            own_cost
+            - min_other
+            + 3.0,
+        )
+
+        cost = (
+            own_cost
+            + ambiguity
+            * 4.0
+        )
+
+        if (
+            station
+            == "NHK総合"
+        ):
+            cost = (
+                cost
+                + np.maximum(
+                    0.0,
+                    spread
+                    - 25.0,
+                )
+                * 1.6
+            )
+
+        evidence_costs[
+            station
+        ] = cost.astype(
+            np.float32,
+            copy=False,
+        )
+
+    return evidence_costs
+
 
 def _station_color_mask(
     roi: np.ndarray,
     station: str,
-    target_rgb: Tuple[int, int, int],
+    target_rgb: Tuple[
+        int,
+        int,
+        int,
+    ],
     tolerance: int,
 ) -> np.ndarray:
-    distance = _color_distance(roi, target_rgb)
+    distance = _color_distance(
+        roi,
+        target_rgb,
+    )
+
     if station == "NHK総合":
-        work = roi.astype(np.int16)
-        spread = work.max(axis=2) - work.min(axis=2)
-        brightness = work.mean(axis=2)
-        return (
-            (distance <= max(55, tolerance))
-            & (brightness < 220)
-            & (spread <= 30)
+        work = roi.astype(
+            np.int16
         )
-    return distance <= tolerance
+
+        spread = (
+            work.max(axis=2)
+            - work.min(axis=2)
+        )
+
+        brightness = work.mean(
+            axis=2
+        )
+
+        return (
+            (
+                distance
+                <= max(
+                    55,
+                    tolerance,
+                )
+            )
+            & (
+                brightness
+                < 220
+            )
+            & (
+                spread
+                <= 30
+            )
+        )
+
+    return (
+        distance
+        <= tolerance
+    )
+
 
 def _find_colored_plot_bounds(
     arr: np.ndarray,
@@ -483,38 +1235,111 @@ def _find_colored_plot_bounds(
     rough_right: int,
     tolerance: int = 50,
 ) -> tuple[int, int]:
-    x0 = max(0, rough_left - 120)
-    x1 = min(arr.shape[1] - 1, rough_right + 120)
-    roi = arr[graph_top:graph_bottom + 1, x0:x1 + 1]
+    x0 = max(
+        0,
+        rough_left - 120,
+    )
+
+    x1 = min(
+        arr.shape[1] - 1,
+        rough_right + 120,
+    )
+
+    roi = arr[
+        graph_top:graph_bottom + 1,
+        x0:x1 + 1,
+    ]
 
     left_edges: list[int] = []
     right_edges: list[int] = []
 
-    for station, color in STATION_COLORS.items():
-        mask = _station_color_mask(roi, station, color, tolerance)
-        columns = np.where(mask.sum(axis=0) > 0)[0]
+    for (
+        station,
+        color,
+    ) in STATION_COLORS.items():
+        mask = _station_color_mask(
+            roi,
+            station,
+            color,
+            tolerance,
+        )
+
+        columns = np.where(
+            mask.sum(axis=0) > 0
+        )[0]
+
         if len(columns) < 10:
             continue
 
-        groups = _group_consecutive(columns, max_gap=8)
-        longest = max(groups, key=lambda group: group[-1] - group[0] + 1)
+        groups = _group_consecutive(
+            columns,
+            max_gap=8,
+        )
 
-        if longest[-1] - longest[0] + 1 < arr.shape[1] * 0.25:
+        longest = max(
+            groups,
+            key=lambda group: (
+                group[-1]
+                - group[0]
+                + 1
+            ),
+        )
+
+        if (
+            longest[-1]
+            - longest[0]
+            + 1
+            < arr.shape[1]
+            * 0.25
+        ):
             continue
 
-        left_edges.append(x0 + longest[0])
-        right_edges.append(x0 + longest[-1])
+        left_edges.append(
+            x0
+            + longest[0]
+        )
+
+        right_edges.append(
+            x0
+            + longest[-1]
+        )
 
     if len(left_edges) < 3:
-        raise RuntimeError("色線から時間軸範囲を推定できませんでした。")
+        raise RuntimeError(
+            "色線から時間軸範囲を推定できませんでした。"
+        )
 
-    left = int(round(float(np.median(left_edges))))
-    right = int(round(float(np.median(right_edges))))
+    left = int(
+        round(
+            float(
+                np.median(
+                    left_edges
+                )
+            )
+        )
+    )
 
-    if right - left < arr.shape[1] * 0.45:
-        raise RuntimeError("色線から得た時間軸範囲が狭すぎます。")
+    right = int(
+        round(
+            float(
+                np.median(
+                    right_edges
+                )
+            )
+        )
+    )
+
+    if (
+        right - left
+        < arr.shape[1]
+        * 0.45
+    ):
+        raise RuntimeError(
+            "色線から得た時間軸範囲が狭すぎます。"
+        )
 
     return left, right
+
 
 def _calibrate_time_axis(
     arr: np.ndarray,
@@ -523,38 +1348,121 @@ def _calibrate_time_axis(
     rough_right: int,
     end_time: datetime,
     duration_minutes: int,
-) -> tuple[float, float, float, str, int]:
+) -> tuple[
+    float,
+    float,
+    float,
+    str,
+    int,
+]:
     peaks = _find_vertical_hour_lines(
-        arr, grid[0], grid[-1], rough_left, rough_right
+        arr,
+        grid[0],
+        grid[-1],
+        rough_left,
+        rough_right,
     )
 
-    start_time = end_time - timedelta(minutes=duration_minutes)
-    first_hour_offset = (-start_time.minute) % 60
-    expected_offsets = list(range(first_hour_offset, duration_minutes + 1, 60))
+    start_time = (
+        end_time
+        - timedelta(
+            minutes=duration_minutes
+        )
+    )
 
-    if len(peaks) >= 2 and len(expected_offsets) >= 2:
+    first_hour_offset = (
+        -start_time.minute
+    ) % 60
+
+    expected_offsets = list(
+        range(
+            first_hour_offset,
+            duration_minutes + 1,
+            60,
+        )
+    )
+
+    if (
+        len(peaks) >= 2
+        and len(
+            expected_offsets
+        ) >= 2
+    ):
         try:
-            start_x, end_x, ppm, matches, _ = _match_time_axis_model(
+            (
+                start_x,
+                end_x,
+                ppm,
+                matches,
+                _,
+            ) = _match_time_axis_model(
                 peaks=peaks,
-                expected_offsets=expected_offsets,
+                expected_offsets=(
+                    expected_offsets
+                ),
                 rough_left=rough_left,
                 rough_right=rough_right,
-                duration_minutes=duration_minutes,
-                image_width=arr.shape[1],
+                duration_minutes=(
+                    duration_minutes
+                ),
+                image_width=(
+                    arr.shape[1]
+                ),
             )
-            return float(start_x), float(end_x), float(ppm), "hour-lines", int(len(matches))
+
+            return (
+                float(start_x),
+                float(end_x),
+                float(ppm),
+                "hour-lines",
+                int(
+                    len(matches)
+                ),
+            )
+
         except RuntimeError:
             pass
 
-    color_left, color_right = _find_colored_plot_bounds(
-        arr, grid[0], grid[-1], rough_left, rough_right, tolerance=50
+    (
+        color_left,
+        color_right,
+    ) = _find_colored_plot_bounds(
+        arr,
+        grid[0],
+        grid[-1],
+        rough_left,
+        rough_right,
+        tolerance=50,
     )
-    start_x = float(color_left)
-    end_x = float(color_right)
-    ppm = (end_x - start_x) / float(duration_minutes)
+
+    start_x = float(
+        color_left
+    )
+
+    end_x = float(
+        color_right
+    )
+
+    ppm = (
+        end_x
+        - start_x
+    ) / float(
+        duration_minutes
+    )
+
     if ppm <= 0:
-        raise RuntimeError("時間軸の横幅が不正です。")
-    return start_x, end_x, ppm, "color-range-fallback", 0
+        raise RuntimeError(
+            "時間軸の横幅が不正です。"
+        )
+
+    return (
+        start_x,
+        end_x,
+        ppm,
+        "color-range-fallback",
+        0,
+    )
+
 
 def _find_cursor_x(
     arr: np.ndarray,
@@ -563,80 +1471,228 @@ def _find_cursor_x(
     rough_right: int,
 ) -> int | None:
     try:
-        color_left, color_right = _find_colored_plot_bounds(
-            arr, grid[0], grid[-1], rough_left, rough_right, tolerance=50
+        (
+            color_left,
+            color_right,
+        ) = _find_colored_plot_bounds(
+            arr,
+            grid[0],
+            grid[-1],
+            rough_left,
+            rough_right,
+            tolerance=50,
         )
-    except RuntimeError:
-        color_left, color_right = rough_left, rough_right
 
-    roi = arr[grid[0]:grid[-1] + 1]
+    except RuntimeError:
+        (
+            color_left,
+            color_right,
+        ) = (
+            rough_left,
+            rough_right,
+        )
+
+    roi = arr[
+        grid[0]:grid[-1] + 1
+    ]
+
     mask = _neutral_gray_mask(
         roi,
         max_spread=35,
         min_brightness=150,
         max_brightness=253,
     )
-    scores = mask.mean(axis=0)
 
-    x_axis = np.arange(arr.shape[1])
+    scores = mask.mean(
+        axis=0
+    )
+
+    x_axis = np.arange(
+        arr.shape[1]
+    )
+
     candidates = np.where(
-        (scores >= 0.82)
-        & (x_axis >= color_left - 10)
-        & (x_axis <= color_right + 10)
+        (
+            scores >= 0.82
+        )
+        & (
+            x_axis
+            >= color_left - 10
+        )
+        & (
+            x_axis
+            <= color_right + 10
+        )
     )[0]
-    groups = _group_consecutive(candidates, max_gap=2)
-    thin_groups = [group for group in groups if 1 <= len(group) <= 8]
+
+    groups = _group_consecutive(
+        candidates,
+        max_gap=2,
+    )
+
+    thin_groups = [
+        group
+        for group in groups
+        if 1 <= len(group) <= 8
+    ]
+
     if not thin_groups:
         return None
 
-    chosen = max(thin_groups, key=lambda group: float(np.max(scores[group])))
-    return int(round(float(np.mean(chosen))))
+    chosen = max(
+        thin_groups,
+        key=lambda group: float(
+            np.max(
+                scores[group]
+            )
+        ),
+    )
+
+    return int(
+        round(
+            float(
+                np.mean(
+                    chosen
+                )
+            )
+        )
+    )
+
 
 def _find_cursor_station_y(
     arr: np.ndarray,
     cursor_x: int,
     graph_top: int,
     graph_bottom: int,
-    target_rgb: Tuple[int, int, int],
+    target_rgb: Tuple[
+        int,
+        int,
+        int,
+    ],
     tolerance: int,
 ) -> float | None:
     window = 14
-    x0 = max(0, cursor_x - window)
-    x1 = min(arr.shape[1] - 1, cursor_x + window)
 
-    roi = arr[graph_top:graph_bottom + 1, x0:x1 + 1]
-    distance = _color_distance(roi, target_rgb)
-    color_mask = distance <= tolerance
-    row_counts = color_mask.sum(axis=1)
+    x0 = max(
+        0,
+        cursor_x - window,
+    )
 
-    maximum = int(row_counts.max())
+    x1 = min(
+        arr.shape[1] - 1,
+        cursor_x + window,
+    )
+
+    roi = arr[
+        graph_top:graph_bottom + 1,
+        x0:x1 + 1,
+    ]
+
+    distance = _color_distance(
+        roi,
+        target_rgb,
+    )
+
+    color_mask = (
+        distance
+        <= tolerance
+    )
+
+    row_counts = (
+        color_mask.sum(axis=1)
+    )
+
+    maximum = int(
+        row_counts.max()
+    )
+
     if maximum < 2:
         return None
 
-    threshold = max(2, int(np.ceil(maximum * 0.45)))
-    rows = np.where(row_counts >= threshold)[0]
-    groups = _group_consecutive(rows, max_gap=2)
+    threshold = max(
+        2,
+        int(
+            np.ceil(
+                maximum * 0.45
+            )
+        ),
+    )
+
+    rows = np.where(
+        row_counts
+        >= threshold
+    )[0]
+
+    groups = _group_consecutive(
+        rows,
+        max_gap=2,
+    )
+
     if not groups:
         return None
 
-    chosen = max(groups, key=lambda group: int(row_counts[group].sum()))
-    y_values = np.array(chosen, dtype=float)
-    weights = row_counts[chosen].astype(float)
-    return float(np.average(y_values, weights=weights) + graph_top)
+    chosen = max(
+        groups,
+        key=lambda group: int(
+            row_counts[group].sum()
+        ),
+    )
 
-def _vertical_local_min(distance: np.ndarray, radius: int) -> np.ndarray:
+    y_values = np.array(
+        chosen,
+        dtype=float,
+    )
+
+    weights = row_counts[
+        chosen
+    ].astype(float)
+
+    return float(
+        np.average(
+            y_values,
+            weights=weights,
+        )
+        + graph_top
+    )
+
+
+def _vertical_local_min(
+    distance: np.ndarray,
+    radius: int,
+) -> np.ndarray:
     if radius <= 0:
-        return distance.astype(np.float32)
+        return distance.astype(
+            np.float32
+        )
 
     h, w = distance.shape
+
     padded = np.pad(
-        distance.astype(np.float32),
-        ((radius, radius), (0, 0)),
+        distance.astype(
+            np.float32
+        ),
+        (
+            (radius, radius),
+            (0, 0),
+        ),
         mode="constant",
         constant_values=255.0,
     )
-    views = [padded[offset:offset + h] for offset in range(radius * 2 + 1)]
-    return np.minimum.reduce(views)
+
+    views = [
+        padded[
+            offset:offset + h
+        ]
+        for offset
+        in range(
+            radius * 2 + 1
+        )
+    ]
+
+    return np.minimum.reduce(
+        views
+    )
+
 
 def _choose_anchor_from_color(
     local_distance: np.ndarray,
@@ -645,22 +1701,73 @@ def _choose_anchor_from_color(
     tolerance: int,
 ) -> tuple[int, float]:
     h, w = local_distance.shape
-    preferred_x = int(np.clip(preferred_x, 0, w - 1))
+
+    preferred_x = int(
+        np.clip(
+            preferred_x,
+            0,
+            w - 1,
+        )
+    )
 
     for radius in range(w):
-        for x in (preferred_x - radius, preferred_x + radius):
+        for x in (
+            preferred_x - radius,
+            preferred_x + radius,
+        ):
             if x < 0 or x >= w:
                 continue
-            column = local_distance[:, x]
-            y = int(np.argmin(column))
-            if float(column[y]) <= tolerance:
-                return x, float(y)
+
+            column = (
+                local_distance[:, x]
+            )
+
+            y = int(
+                np.argmin(
+                    column
+                )
+            )
+
+            if (
+                float(
+                    column[y]
+                )
+                <= tolerance
+            ):
+                return (
+                    x,
+                    float(y),
+                )
 
     x = preferred_x
-    y = int(np.argmin(local_distance[:, x]))
-    if float(local_distance[y, x]) > max(90.0, tolerance * 2.0):
-        raise RuntimeError("安定した色線アンカーを見つけられませんでした。")
-    return x, float(y)
+
+    y = int(
+        np.argmin(
+            local_distance[:, x]
+        )
+    )
+
+    if (
+        float(
+            local_distance[
+                y,
+                x,
+            ]
+        )
+        > max(
+            90.0,
+            tolerance * 2.0,
+        )
+    ):
+        raise RuntimeError(
+            "安定した色線アンカーを見つけられませんでした。"
+        )
+
+    return (
+        x,
+        float(y),
+    )
+
 
 def _beam_trace_direction(
     emission: np.ndarray,
@@ -671,63 +1778,213 @@ def _beam_trace_direction(
     beam_width: int,
     smoothness: float,
     anchor_strength: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+]:
     h, w = emission.shape
-    if direction not in (-1, 1):
-        raise ValueError("directionは-1または1です。")
 
-    columns = list(range(anchor_x, w if direction == 1 else -1, direction))
-    n = len(columns)
-    k = min(beam_width, h)
+    if direction not in (
+        -1,
+        1,
+    ):
+        raise ValueError(
+            "directionは-1または1です。"
+        )
 
-    beam_y = np.empty((n, k), dtype=np.int16)
-    parent_dtype = np.int8 if k <= 127 else np.int16
-    parents = np.zeros((n, k), dtype=parent_dtype)
-
-    y_axis_1d = np.arange(h, dtype=np.float32)
-    first_x = columns[0]
-    first_cost = (
-        emission[:, first_x].astype(np.float32)
-        + anchor_strength * np.abs(y_axis_1d - float(anchor_y))
+    columns = list(
+        range(
+            anchor_x,
+            (
+                w
+                if direction == 1
+                else -1
+            ),
+            direction,
+        )
     )
-    selected = np.argpartition(first_cost, k - 1)[:k]
-    selected = selected[np.argsort(first_cost[selected])]
+
+    n = len(columns)
+
+    k = min(
+        beam_width,
+        h,
+    )
+
+    beam_y = np.empty(
+        (n, k),
+        dtype=np.int16,
+    )
+
+    parent_dtype = (
+        np.int8
+        if k <= 127
+        else np.int16
+    )
+
+    parents = np.zeros(
+        (n, k),
+        dtype=parent_dtype,
+    )
+
+    y_axis_1d = np.arange(
+        h,
+        dtype=np.float32,
+    )
+
+    first_x = columns[0]
+
+    first_cost = (
+        emission[
+            :,
+            first_x,
+        ].astype(
+            np.float32
+        )
+        + anchor_strength
+        * np.abs(
+            y_axis_1d
+            - float(anchor_y)
+        )
+    )
+
+    selected = np.argpartition(
+        first_cost,
+        k - 1,
+    )[:k]
+
+    selected = selected[
+        np.argsort(
+            first_cost[
+                selected
+            ]
+        )
+    ]
+
     beam_y[0] = selected
-    costs = first_cost[selected].astype(np.float32)
+
+    costs = first_cost[
+        selected
+    ].astype(
+        np.float32
+    )
+
     costs -= costs.min()
 
-    y_axis = y_axis_1d[:, None]
+    y_axis = (
+        y_axis_1d[:, None]
+    )
 
-    for step_index in range(1, n):
-        x = columns[step_index]
-        prev_y = beam_y[step_index - 1].astype(np.float32)
+    for step_index in range(
+        1,
+        n,
+    ):
+        x = columns[
+            step_index
+        ]
+
+        prev_y = beam_y[
+            step_index - 1
+        ].astype(
+            np.float32
+        )
+
         transition = (
             costs[None, :]
-            + smoothness * np.abs(y_axis - prev_y[None, :])
+            + smoothness
+            * np.abs(
+                y_axis
+                - prev_y[None, :]
+            )
         )
-        best_parent = np.argmin(transition, axis=1)
+
+        best_parent = np.argmin(
+            transition,
+            axis=1,
+        )
+
         best_cost = (
-            transition[np.arange(h), best_parent]
+            transition[
+                np.arange(h),
+                best_parent,
+            ]
             + emission[:, x]
         )
 
-        selected = np.argpartition(best_cost, k - 1)[:k]
-        selected = selected[np.argsort(best_cost[selected])]
-        beam_y[step_index] = selected
-        parents[step_index] = best_parent[selected]
+        selected = np.argpartition(
+            best_cost,
+            k - 1,
+        )[:k]
 
-        costs = best_cost[selected].astype(np.float32)
+        selected = selected[
+            np.argsort(
+                best_cost[
+                    selected
+                ]
+            )
+        ]
+
+        beam_y[
+            step_index
+        ] = selected
+
+        parents[
+            step_index
+        ] = best_parent[
+            selected
+        ]
+
+        costs = best_cost[
+            selected
+        ].astype(
+            np.float32
+        )
+
         costs -= costs.min()
 
-    slot = int(np.argmin(costs))
-    path_local = np.empty(n, dtype=np.float32)
-    for step_index in range(n - 1, -1, -1):
-        path_local[step_index] = float(beam_y[step_index, slot])
-        if step_index:
-            slot = int(parents[step_index, slot])
+    slot = int(
+        np.argmin(
+            costs
+        )
+    )
 
-    x_values = np.array(columns, dtype=int)
-    return x_values, path_local
+    path_local = np.empty(
+        n,
+        dtype=np.float32,
+    )
+
+    for step_index in range(
+        n - 1,
+        -1,
+        -1,
+    ):
+        path_local[
+            step_index
+        ] = float(
+            beam_y[
+                step_index,
+                slot,
+            ]
+        )
+
+        if step_index:
+            slot = int(
+                parents[
+                    step_index,
+                    slot,
+                ]
+            )
+
+    x_values = np.array(
+        columns,
+        dtype=int,
+    )
+
+    return (
+        x_values,
+        path_local,
+    )
+
 
 def _refine_path(
     evidence_cost: np.ndarray,
@@ -735,49 +1992,141 @@ def _refine_path(
     *,
     direct_threshold: float,
     radius: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    DP経路の近傍から、対象局らしい実ピクセル群の中心へスナップする。
+    DP経路の近傍から、
+    対象局らしい実ピクセル群の中心へスナップする。
+    """
 
-    observed=True は単なるRGB近似ではなく、
-    アンチエイリアスと他局色の競合を考慮した evidence_cost が
-    十分低い場合だけ付ける。
-    """
     h, w = evidence_cost.shape
-    refined = path.astype(np.float32).copy()
-    observed = np.zeros(w, dtype=bool)
 
-    search_radius = max(3, radius + 3)
+    refined = path.astype(
+        np.float32
+    ).copy()
+
+    observed = np.zeros(
+        w,
+        dtype=bool,
+    )
+
+    search_radius = max(
+        3,
+        radius + 3,
+    )
+
     for x in range(w):
-        center = int(round(float(path[x])))
-        y0 = max(0, center - search_radius)
-        y1 = min(h - 1, center + search_radius)
+        center = int(
+            round(
+                float(
+                    path[x]
+                )
+            )
+        )
 
-        rows = np.arange(y0, y1 + 1)
-        costs = evidence_cost[y0:y1 + 1, x]
-        good = rows[costs <= direct_threshold]
+        y0 = max(
+            0,
+            center
+            - search_radius,
+        )
+
+        y1 = min(
+            h - 1,
+            center
+            + search_radius,
+        )
+
+        rows = np.arange(
+            y0,
+            y1 + 1,
+        )
+
+        costs = evidence_cost[
+            y0:y1 + 1,
+            x,
+        ]
+
+        good = rows[
+            costs
+            <= direct_threshold
+        ]
 
         if len(good):
-            groups = _group_consecutive(good, max_gap=1)
+            groups = (
+                _group_consecutive(
+                    good,
+                    max_gap=1,
+                )
+            )
 
-            def group_score(group: list[int]) -> float:
-                group_arr = np.array(group, dtype=int)
-                local_cost = float(np.mean(evidence_cost[group_arr, x]))
-                center_distance = abs(float(np.mean(group_arr)) - float(path[x]))
-                # 2～数pxの線幅を単発ノイズより少し優先する。
-                thickness_bonus = min(len(group), 6) * 0.35
-                return local_cost + center_distance * 1.5 - thickness_bonus
+            def group_score(
+                group: list[int],
+            ) -> float:
+                group_arr = np.array(
+                    group,
+                    dtype=int,
+                )
 
-            chosen = min(groups, key=group_score)
-            refined[x] = float(np.mean(chosen))
+                local_cost = float(
+                    np.mean(
+                        evidence_cost[
+                            group_arr,
+                            x,
+                        ]
+                    )
+                )
+
+                center_distance = abs(
+                    float(
+                        np.mean(
+                            group_arr
+                        )
+                    )
+                    - float(
+                        path[x]
+                    )
+                )
+
+                thickness_bonus = (
+                    min(
+                        len(group),
+                        6,
+                    )
+                    * 0.35
+                )
+
+                return (
+                    local_cost
+                    + center_distance
+                    * 1.5
+                    - thickness_bonus
+                )
+
+            chosen = min(
+                groups,
+                key=group_score,
+            )
+
+            refined[x] = float(
+                np.mean(
+                    chosen
+                )
+            )
+
             observed[x] = True
 
-    return refined, observed
+    return (
+        refined,
+        observed,
+    )
+
 
 def _trace_station_global(
     arr: np.ndarray,
     station: str,
-    color: Tuple[int, int, int],
+    evidence_cost: np.ndarray,
     trace_left: int,
     trace_right: int,
     graph_top: int,
@@ -786,133 +2135,307 @@ def _trace_station_global(
     cursor_x: int | None = None,
     cursor_y: float | None = None,
     grid_rows: list[int] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | str]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[
+        str,
+        float | int | str,
+    ],
+]:
     """
     全幅を動的計画法で追跡する9.1方式。
 
-    9.0の単純RGB距離では、他局線のアンチエイリアス縁が対象局色へ近づき、
-    交差付近で一瞬だけ別局へ乗り移ることがあった。
-    9.1では「局色＋白背景」の混色モデルと他局色との相対比較を使う。
+    色証拠コストは6局共通で事前計算済み。
     """
-    x0 = max(0, int(trace_left))
-    x1 = min(arr.shape[1] - 1, int(trace_right))
-    roi = arr[graph_top:graph_bottom + 1, x0:x1 + 1]
 
-    evidence_cost, _ = _station_evidence_cost(
-        roi,
-        station,
-        color,
+    x0 = max(
+        0,
+        int(trace_left),
     )
+
+    x1 = min(
+        arr.shape[1] - 1,
+        int(trace_right),
+    )
+
+    roi = arr[
+        graph_top:graph_bottom + 1,
+        x0:x1 + 1,
+    ]
+
+    if (
+        evidence_cost.shape
+        != roi.shape[:2]
+    ):
+        raise RuntimeError(
+            f"{station}の事前計算色コストサイズが一致しません。"
+            f" expected={roi.shape[:2]}"
+            f" actual={evidence_cost.shape}"
+        )
 
     line_radius = max(
         1,
         min(
             4,
-            int(round((graph_bottom - graph_top + 1) / 400.0)),
+            int(
+                round(
+                    (
+                        graph_bottom
+                        - graph_top
+                        + 1
+                    )
+                    / 400.0
+                )
+            ),
         ),
     )
-    local_cost = _vertical_local_min(evidence_cost, line_radius)
 
-    # DP用コスト。極端な値はクリップして一部ノイズの影響を抑える。
-    emission = np.minimum(local_cost.astype(np.float32), 150.0)
+    local_cost = (
+        _vertical_local_min(
+            evidence_cost,
+            line_radius,
+        )
+    )
 
-    # 「直接観測」とみなす閾値。
-    # toleranceは従来UIとの互換のため残すが、アンチエイリアスコストでは
-    # 42前後が十分緩い。過度に大きくしない。
-    direct_threshold = float(np.clip(tolerance, 24, 48))
+    emission = np.minimum(
+        local_cost.astype(
+            np.float32
+        ),
+        150.0,
+    )
 
-    preferred_local_x = (x1 - x0) // 2
-    suppressed_cursor_band: tuple[int, int] | None = None
+    direct_threshold = float(
+        np.clip(
+            tolerance,
+            24,
+            48,
+        )
+    )
+
+    preferred_local_x = (
+        x1 - x0
+    ) // 2
+
+    suppressed_cursor_band: (
+        tuple[int, int]
+        | None
+    ) = None
 
     if station == "NHK総合":
-        # 既知の水平グリッドはNHKと同じ無彩色なので強めに抑制する。
-        # 本物NHKが線上を横切る箇所は数pxだけ色証拠が弱くなるが、
-        # 前後の経路で自然に橋渡しできる。
         if grid_rows:
-            grid_radius = max(2, int(round(arr.shape[0] * 0.0015)))
-            for global_y in grid_rows:
-                local_y = int(global_y - graph_top)
-                y0 = max(0, local_y - grid_radius)
-                y1 = min(emission.shape[0], local_y + grid_radius + 1)
-                if y0 < y1:
-                    emission[y0:y1, :] += 38.0
+            grid_radius = max(
+                2,
+                int(
+                    round(
+                        arr.shape[0]
+                        * 0.0015
+                    )
+                ),
+            )
 
-        # 明るい中立灰色（UI/補助線）も追加で罰する。
-        work = roi.astype(np.int16)
-        brightness = work.mean(axis=2)
-        spread = work.max(axis=2) - work.min(axis=2)
+            for global_y in grid_rows:
+                local_y = int(
+                    global_y
+                    - graph_top
+                )
+
+                y0 = max(
+                    0,
+                    local_y
+                    - grid_radius,
+                )
+
+                y1 = min(
+                    emission.shape[0],
+                    local_y
+                    + grid_radius
+                    + 1,
+                )
+
+                if y0 < y1:
+                    emission[
+                        y0:y1,
+                        :,
+                    ] += 38.0
+
+        work = roi.astype(
+            np.int16
+        )
+
+        brightness = (
+            work.mean(axis=2)
+        )
+
+        spread = (
+            work.max(axis=2)
+            - work.min(axis=2)
+        )
+
         ui_gray = (
             (brightness > 215)
             & (spread <= 18)
         )
-        emission += ui_gray.astype(np.float32) * 24.0
 
-        # カーソルはNHK色に近い灰色実線なので、そのごく狭い帯を
-        # 色証拠なしとして左右から橋渡しする。
-        if cursor_x is not None and x0 <= cursor_x <= x1:
-            local_cursor_x = int(cursor_x - x0)
+        emission += (
+            ui_gray.astype(
+                np.float32
+            )
+            * 24.0
+        )
+
+        if (
+            cursor_x is not None
+            and x0
+            <= cursor_x
+            <= x1
+        ):
+            local_cursor_x = int(
+                cursor_x - x0
+            )
+
             suppress_radius = max(
                 4,
-                int(round(arr.shape[1] * 0.0025)),
+                int(
+                    round(
+                        arr.shape[1]
+                        * 0.0025
+                    )
+                ),
             )
-            band_left = max(0, local_cursor_x - suppress_radius)
+
+            band_left = max(
+                0,
+                local_cursor_x
+                - suppress_radius,
+            )
+
             band_right = min(
                 emission.shape[1],
-                local_cursor_x + suppress_radius + 1,
+                local_cursor_x
+                + suppress_radius
+                + 1,
             )
-            emission[:, band_left:band_right] = np.maximum(
-                emission[:, band_left:band_right],
+
+            emission[
+                :,
+                band_left:band_right,
+            ] = np.maximum(
+                emission[
+                    :,
+                    band_left:band_right,
+                ],
                 85.0,
             )
-            suppressed_cursor_band = (band_left, band_right)
 
-            if band_left <= preferred_local_x < band_right:
+            suppressed_cursor_band = (
+                band_left,
+                band_right,
+            )
+
+            if (
+                band_left
+                <= preferred_local_x
+                < band_right
+            ):
                 preferred_local_x = min(
-                    emission.shape[1] - 1,
-                    band_right + max(6, suppress_radius),
+                    emission.shape[1]
+                    - 1,
+                    band_right
+                    + max(
+                        6,
+                        suppress_radius,
+                    ),
                 )
 
     anchor_used = "color"
+
     if (
         station != "NHK総合"
         and cursor_x is not None
         and cursor_y is not None
-        and x0 <= cursor_x <= x1
+        and x0
+        <= cursor_x
+        <= x1
     ):
-        anchor_x = int(cursor_x - x0)
-        anchor_y = float(cursor_y - graph_top)
+        anchor_x = int(
+            cursor_x
+            - x0
+        )
+
+        anchor_y = float(
+            cursor_y
+            - graph_top
+        )
+
         anchor_used = "cursor"
+
     else:
-        anchor_x, anchor_y = _choose_anchor_from_color(
+        (
+            anchor_x,
+            anchor_y,
+        ) = _choose_anchor_from_color(
             local_cost,
-            preferred_x=preferred_local_x,
-            tolerance=int(round(direct_threshold)),
+            preferred_x=(
+                preferred_local_x
+            ),
+            tolerance=int(
+                round(
+                    direct_threshold
+                )
+            ),
         )
 
         if (
-            suppressed_cursor_band is not None
-            and suppressed_cursor_band[0] <= anchor_x < suppressed_cursor_band[1]
+            suppressed_cursor_band
+            is not None
+            and suppressed_cursor_band[0]
+            <= anchor_x
+            < suppressed_cursor_band[1]
         ):
             retry_x = min(
-                emission.shape[1] - 1,
+                emission.shape[1]
+                - 1,
                 suppressed_cursor_band[1]
                 + max(
                     6,
-                    suppressed_cursor_band[1]
-                    - suppressed_cursor_band[0],
+                    (
+                        suppressed_cursor_band[1]
+                        - suppressed_cursor_band[0]
+                    ),
                 ),
             )
-            anchor_x, anchor_y = _choose_anchor_from_color(
+
+            (
+                anchor_x,
+                anchor_y,
+            ) = _choose_anchor_from_color(
                 local_cost,
                 preferred_x=retry_x,
-                tolerance=int(round(direct_threshold)),
+                tolerance=int(
+                    round(
+                        direct_threshold
+                    )
+                ),
             )
 
-    # NHKは色が他要素と競合しやすいので滑らかさを少し強くする。
-    smoothness = 0.62 if station == "NHK総合" else 0.50
-    beam_width = 32 if station == "NHK総合" else 24
+    smoothness = (
+        0.62
+        if station == "NHK総合"
+        else 0.50
+    )
 
-    right_x, right_path = _beam_trace_direction(
+    beam_width = (
+        32
+        if station == "NHK総合"
+        else 24
+    )
+
+    (
+        right_x,
+        right_path,
+    ) = _beam_trace_direction(
         emission,
         anchor_x=anchor_x,
         anchor_y=anchor_y,
@@ -921,7 +2444,11 @@ def _trace_station_global(
         smoothness=smoothness,
         anchor_strength=7.0,
     )
-    left_x, left_path = _beam_trace_direction(
+
+    (
+        left_x,
+        left_path,
+    ) = _beam_trace_direction(
         emission,
         anchor_x=anchor_x,
         anchor_y=anchor_y,
@@ -931,68 +2458,158 @@ def _trace_station_global(
         anchor_strength=7.0,
     )
 
-    path = np.full(x1 - x0 + 1, np.nan, dtype=np.float32)
-    path[right_x] = right_path
-    path[left_x] = left_path
+    path = np.full(
+        x1 - x0 + 1,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    path[right_x] = (
+        right_path
+    )
+
+    path[left_x] = (
+        left_path
+    )
 
     if np.isnan(path).any():
-        raise RuntimeError(f"{station}の全幅経路を復元できませんでした。")
+        raise RuntimeError(
+            f"{station}の全幅経路を復元できませんでした。"
+        )
 
-    refined, observed = _refine_path(
+    (
+        refined,
+        observed,
+    ) = _refine_path(
         evidence_cost,
         path,
-        direct_threshold=direct_threshold,
+        direct_threshold=(
+            direct_threshold
+        ),
         radius=line_radius,
     )
 
-    # NHKカーソル帯は実測扱いしない。DP経路をそのまま使う。
-    if suppressed_cursor_band is not None:
-        band_left, band_right = suppressed_cursor_band
-        refined[band_left:band_right] = path[band_left:band_right]
-        observed[band_left:band_right] = False
+    if (
+        suppressed_cursor_band
+        is not None
+    ):
+        (
+            band_left,
+            band_right,
+        ) = suppressed_cursor_band
 
-    # 非NHKの色付きカーソル円は信頼できる観測なので中心を戻す。
+        refined[
+            band_left:band_right
+        ] = path[
+            band_left:band_right
+        ]
+
+        observed[
+            band_left:band_right
+        ] = False
+
     if (
         station != "NHK総合"
         and cursor_x is not None
         and cursor_y is not None
-        and x0 <= cursor_x <= x1
+        and x0
+        <= cursor_x
+        <= x1
     ):
-        local_cursor_x = int(cursor_x - x0)
-        left = max(0, local_cursor_x - 1)
-        right = min(len(refined), local_cursor_x + 2)
-        refined[left:right] = float(cursor_y - graph_top)
-        observed[left:right] = True
+        local_cursor_x = int(
+            cursor_x
+            - x0
+        )
 
-    xs = np.arange(x0, x1 + 1)
-    ys = refined + float(graph_top)
+        left = max(
+            0,
+            local_cursor_x - 1,
+        )
 
-    inferred_groups = _group_consecutive(
-        np.where(~observed)[0],
-        max_gap=1,
+        right = min(
+            len(refined),
+            local_cursor_x + 2,
+        )
+
+        refined[
+            left:right
+        ] = float(
+            cursor_y
+            - graph_top
+        )
+
+        observed[
+            left:right
+        ] = True
+
+    xs = np.arange(
+        x0,
+        x1 + 1,
     )
+
+    ys = (
+        refined
+        + float(graph_top)
+    )
+
+    inferred_groups = (
+        _group_consecutive(
+            np.where(
+                ~observed
+            )[0],
+            max_gap=1,
+        )
+    )
+
     max_gap_pixels = max(
-        (len(group) for group in inferred_groups),
+        (
+            len(group)
+            for group
+            in inferred_groups
+        ),
         default=0,
     )
-    coverage = float(observed.mean())
+
+    coverage = float(
+        observed.mean()
+    )
 
     quality = (
         "A"
         if coverage >= 0.97
-        else ("B" if coverage >= 0.90 else "C")
+        else (
+            "B"
+            if coverage >= 0.90
+            else "C"
+        )
     )
 
-    diagnostics: dict[str, float | int | str] = {
+    diagnostics: dict[
+        str,
+        float | int | str,
+    ] = {
         "coverage": coverage,
-        "max_gap_pixels": int(max_gap_pixels),
+        "max_gap_pixels": int(
+            max_gap_pixels
+        ),
         "rejected_jumps": 0,
         "quality": quality,
-        "tracking_method": "global-dp-antialias",
+        "tracking_method": (
+            "global-dp-antialias"
+        ),
         "anchor": anchor_used,
-        "inferred_pixels": int((~observed).sum()),
+        "inferred_pixels": int(
+            (~observed).sum()
+        ),
     }
-    return xs, ys, observed, diagnostics
+
+    return (
+        xs,
+        ys,
+        observed,
+        diagnostics,
+    )
+
 
 def analyze_image(
     arr: np.ndarray,
@@ -1000,22 +2617,73 @@ def analyze_image(
     duration_minutes: int = 180,
     tolerance: int = 42,
     grid_percent_step: float = 2.0,
-) -> tuple[pd.DataFrame, Calibration, dict[str, dict[str, float | int | str]]]:
-    if arr.ndim != 3 or arr.shape[2] != 3:
-        raise ValueError("RGB画像を指定してください。")
+) -> tuple[
+    pd.DataFrame,
+    Calibration,
+    dict[
+        str,
+        dict[
+            str,
+            float | int | str,
+        ],
+    ],
+]:
+    if (
+        arr.ndim != 3
+        or arr.shape[2] != 3
+    ):
+        raise ValueError(
+            "RGB画像を指定してください。"
+        )
+
     if duration_minutes <= 0:
-        raise ValueError("表示時間は1分以上にしてください。")
+        raise ValueError(
+            "表示時間は1分以上にしてください。"
+        )
+
     if grid_percent_step <= 0:
-        raise ValueError("縦軸1目盛りは0より大きい値にしてください。")
+        raise ValueError(
+            "縦軸1目盛りは0より大きい値にしてください。"
+        )
 
-    thin_lines = _find_thin_horizontal_lines(arr)
-    grid, grid_gap = _select_regular_grid(thin_lines, arr.shape[0], min_lines=3)
+    thin_lines = (
+        _find_thin_horizontal_lines(
+            arr
+        )
+    )
 
-    graph_top = int(grid[0])
-    y_zero = int(grid[-1])
-    pixels_per_percent = grid_gap / float(grid_percent_step)
+    (
+        grid,
+        grid_gap,
+    ) = _select_regular_grid(
+        thin_lines,
+        arr.shape[0],
+        min_lines=3,
+    )
 
-    rough_left, rough_right = _find_rough_graph_x_bounds(arr, grid)
+    graph_top = int(
+        grid[0]
+    )
+
+    y_zero = int(
+        grid[-1]
+    )
+
+    pixels_per_percent = (
+        grid_gap
+        / float(
+            grid_percent_step
+        )
+    )
+
+    (
+        rough_left,
+        rough_right,
+    ) = _find_rough_graph_x_bounds(
+        arr,
+        grid,
+    )
+
     (
         start_x,
         end_x,
@@ -1034,45 +2702,156 @@ def analyze_image(
     calibration = Calibration(
         graph_left=start_x,
         graph_right=end_x,
-        graph_top=float(graph_top),
-        graph_bottom=float(y_zero),
-        y_zero=float(y_zero),
-        pixels_per_percent=float(pixels_per_percent),
-        pixels_per_minute=float(pixels_per_minute),
-        start_time=end_time - timedelta(minutes=duration_minutes),
+        graph_top=float(
+            graph_top
+        ),
+        graph_bottom=float(
+            y_zero
+        ),
+        y_zero=float(
+            y_zero
+        ),
+        pixels_per_percent=float(
+            pixels_per_percent
+        ),
+        pixels_per_minute=float(
+            pixels_per_minute
+        ),
+        start_time=(
+            end_time
+            - timedelta(
+                minutes=(
+                    duration_minutes
+                )
+            )
+        ),
         end_time=end_time,
-        duration_minutes=duration_minutes,
-        grid_percent_step=float(grid_percent_step),
-        grid_gap_pixels=float(grid_gap),
-        time_axis_method=time_axis_method,
-        time_line_inliers=time_line_inliers,
+        duration_minutes=(
+            duration_minutes
+        ),
+        grid_percent_step=float(
+            grid_percent_step
+        ),
+        grid_gap_pixels=float(
+            grid_gap
+        ),
+        time_axis_method=(
+            time_axis_method
+        ),
+        time_line_inliers=(
+            time_line_inliers
+        ),
     )
 
-    cursor_x = _find_cursor_x(arr, grid, rough_left, rough_right)
+    cursor_x = _find_cursor_x(
+        arr,
+        grid,
+        rough_left,
+        rough_right,
+    )
 
-    traces: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    diagnostics: dict[str, dict[str, float | int | str]] = {}
+    traces: dict[
+        str,
+        tuple[
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+        ],
+    ] = {}
 
-    for station, color in STATION_COLORS.items():
+    diagnostics: dict[
+        str,
+        dict[
+            str,
+            float | int | str,
+        ],
+    ] = {}
+
+    # =========================================
+    # 6局共通の追跡範囲
+    # =========================================
+
+    trace_left = max(
+        0,
+        int(
+            np.floor(
+                start_x
+            )
+        ) - 4,
+    )
+
+    trace_right = min(
+        arr.shape[1] - 1,
+        int(
+            np.ceil(
+                end_x
+            )
+        ) + 4,
+    )
+
+    trace_roi = arr[
+        graph_top:y_zero + 1,
+        trace_left:trace_right + 1,
+    ]
+
+    # =========================================
+    # 高速化の本体
+    #
+    # 旧:
+    # 6局 × 6色 = 36回の全面色計算
+    #
+    # 新:
+    # 6色を各1回 = 6回
+    # =========================================
+
+    evidence_costs = (
+        _precompute_station_evidence_costs(
+            trace_roi
+        )
+    )
+
+    # =========================================
+    # 6局の線を追跡
+    # =========================================
+
+    for (
+        station,
+        color,
+    ) in STATION_COLORS.items():
         cursor_y = None
-        # 非NHKは局色のカーソル円を強いアンカーとして使える。
-        # NHKはカーソル自体が灰色なので、誤アンカー防止のため使わない。
-        if cursor_x is not None and station != "NHK総合":
-            cursor_y = _find_cursor_station_y(
-                arr,
-                cursor_x,
-                graph_top,
-                y_zero,
-                color,
-                tolerance=max(tolerance, 20),
+
+        if (
+            cursor_x is not None
+            and station
+            != "NHK総合"
+        ):
+            cursor_y = (
+                _find_cursor_station_y(
+                    arr,
+                    cursor_x,
+                    graph_top,
+                    y_zero,
+                    color,
+                    tolerance=max(
+                        tolerance,
+                        20,
+                    ),
+                )
             )
 
-        xs, ys, observed, station_diagnostics = _trace_station_global(
+        (
+            xs,
+            ys,
+            observed,
+            station_diagnostics,
+        ) = _trace_station_global(
             arr,
             station,
-            color,
-            max(0, int(np.floor(start_x)) - 4),
-            min(arr.shape[1] - 1, int(np.ceil(end_x)) + 4),
+            evidence_costs[
+                station
+            ],
+            trace_left,
+            trace_right,
             graph_top,
             y_zero,
             tolerance,
@@ -1082,77 +2861,283 @@ def analyze_image(
         )
 
         gap_minutes = (
-            float(station_diagnostics["max_gap_pixels"]) / pixels_per_minute
+            float(
+                station_diagnostics[
+                    "max_gap_pixels"
+                ]
+            )
+            / pixels_per_minute
         )
-        station_diagnostics["max_gap_minutes"] = round(gap_minutes, 2)
 
-        coverage = float(station_diagnostics["coverage"])
-        if coverage >= 0.97 and gap_minutes <= 2.0:
-            station_diagnostics["quality"] = "A"
-        elif coverage >= 0.90 and gap_minutes <= 5.0:
-            station_diagnostics["quality"] = "B"
+        station_diagnostics[
+            "max_gap_minutes"
+        ] = round(
+            gap_minutes,
+            2,
+        )
+
+        coverage = float(
+            station_diagnostics[
+                "coverage"
+            ]
+        )
+
+        if (
+            coverage >= 0.97
+            and gap_minutes <= 2.0
+        ):
+            station_diagnostics[
+                "quality"
+            ] = "A"
+
+        elif (
+            coverage >= 0.90
+            and gap_minutes <= 5.0
+        ):
+            station_diagnostics[
+                "quality"
+            ] = "B"
+
         else:
-            station_diagnostics["quality"] = "C"
+            station_diagnostics[
+                "quality"
+            ] = "C"
 
-        traces[station] = (xs, ys, observed)
-        diagnostics[station] = station_diagnostics
+        traces[
+            station
+        ] = (
+            xs,
+            ys,
+            observed,
+        )
+
+        diagnostics[
+            station
+        ] = station_diagnostics
+
+    # =========================================
+    # 1分刻みへ変換
+    # =========================================
 
     times = [
-        calibration.start_time + timedelta(minutes=minute)
-        for minute in range(duration_minutes + 1)
+        calibration.start_time
+        + timedelta(
+            minutes=minute
+        )
+        for minute
+        in range(
+            duration_minutes
+            + 1
+        )
     ]
-    df = pd.DataFrame({"日時": times})
 
-    # 計算用は丸め前を保持する。
-    raw_station_values: dict[str, np.ndarray] = {}
-    station_status: dict[str, list[str]] = {}
+    df = pd.DataFrame(
+        {
+            "日時": times
+        }
+    )
 
-    for station, (xs, ys, observed) in traces.items():
-        values = np.empty(duration_minutes + 1, dtype=float)
+    raw_station_values: dict[
+        str,
+        np.ndarray,
+    ] = {}
+
+    station_status: dict[
+        str,
+        list[str],
+    ] = {}
+
+    for (
+        station,
+        (
+            xs,
+            ys,
+            observed,
+        ),
+    ) in traces.items():
+        values = np.empty(
+            duration_minutes + 1,
+            dtype=float,
+        )
+
         statuses: list[str] = []
 
-        for minute in range(duration_minutes + 1):
-            x = start_x + minute * pixels_per_minute
-            y = float(np.interp(x, xs, ys))
-            rating = max(0.0, (y_zero - y) / pixels_per_percent)
-            values[minute] = rating
+        for minute in range(
+            duration_minutes + 1
+        ):
+            x = (
+                start_x
+                + minute
+                * pixels_per_minute
+            )
 
-            nearest = int(np.clip(np.argmin(np.abs(xs - x)), 0, len(xs) - 1))
-            statuses.append("実測" if bool(observed[nearest]) else "経路推定")
+            y = float(
+                np.interp(
+                    x,
+                    xs,
+                    ys,
+                )
+            )
 
-        raw_station_values[station] = values
-        station_status[station] = statuses
-        df[station] = np.round(values, 1)
+            rating = max(
+                0.0,
+                (
+                    y_zero - y
+                )
+                / pixels_per_percent,
+            )
 
-    stations = list(STATION_COLORS)
-    raw_matrix = np.column_stack([raw_station_values[s] for s in stations])
-    raw_total = raw_matrix.sum(axis=1)
+            values[
+                minute
+            ] = rating
 
-    df["6局合計"] = np.round(raw_total, 1)
-    df["その他5局合計"] = np.round(
-        raw_total - raw_station_values["NHK総合"], 1
+            nearest = int(
+                np.clip(
+                    np.argmin(
+                        np.abs(
+                            xs - x
+                        )
+                    ),
+                    0,
+                    len(xs) - 1,
+                )
+            )
+
+            statuses.append(
+                "実測"
+                if bool(
+                    observed[
+                        nearest
+                    ]
+                )
+                else "経路推定"
+            )
+
+        raw_station_values[
+            station
+        ] = values
+
+        station_status[
+            station
+        ] = statuses
+
+        df[
+            station
+        ] = np.round(
+            values,
+            1,
+        )
+
+    stations = list(
+        STATION_COLORS
     )
+
+    raw_matrix = np.column_stack(
+        [
+            raw_station_values[
+                station
+            ]
+            for station
+            in stations
+        ]
+    )
+
+    raw_total = (
+        raw_matrix.sum(axis=1)
+    )
+
+    df[
+        "6局合計"
+    ] = np.round(
+        raw_total,
+        1,
+    )
+
+    df[
+        "その他5局合計"
+    ] = np.round(
+        raw_total
+        - raw_station_values[
+            "NHK総合"
+        ],
+        1,
+    )
+
+    # =========================================
+    # シェア
+    # =========================================
 
     for station in stations:
         share = np.divide(
-            raw_station_values[station],
+            raw_station_values[
+                station
+            ],
             raw_total,
-            out=np.full_like(raw_total, np.nan, dtype=float),
-            where=raw_total != 0,
+            out=np.full_like(
+                raw_total,
+                np.nan,
+                dtype=float,
+            ),
+            where=(
+                raw_total != 0
+            ),
         ) * 100.0
-        df[f"{station}_シェア"] = np.round(share, 2)
 
-    raw_rank_df = pd.DataFrame(
-        {station: raw_station_values[station] for station in stations}
+        df[
+            f"{station}_シェア"
+        ] = np.round(
+            share,
+            2,
+        )
+
+    # =========================================
+    # 順位
+    # =========================================
+
+    raw_rank_df = (
+        pd.DataFrame(
+            {
+                station: (
+                    raw_station_values[
+                        station
+                    ]
+                )
+                for station
+                in stations
+            }
+        )
     )
-    ranks = raw_rank_df.rank(axis=1, ascending=False, method="min")
-    for station in stations:
-        df[f"{station}_順位"] = ranks[station].astype("Int64")
 
-    # 解析の透明性のため状態列を末尾へ付加。
-    for station in stations:
-        df[f"{station}_状態"] = station_status[station]
+    ranks = raw_rank_df.rank(
+        axis=1,
+        ascending=False,
+        method="min",
+    )
 
-    return df, calibration, diagnostics
+    for station in stations:
+        df[
+            f"{station}_順位"
+        ] = ranks[
+            station
+        ].astype(
+            "Int64"
+        )
+
+    # =========================================
+    # 実測 / 経路推定
+    # =========================================
+
+    for station in stations:
+        df[
+            f"{station}_状態"
+        ] = station_status[
+            station
+        ]
+
+    return (
+        df,
+        calibration,
+        diagnostics,
+    )
 
 
