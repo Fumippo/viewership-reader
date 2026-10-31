@@ -76,7 +76,7 @@ def _find_thin_horizontal_lines(arr: np.ndarray) -> list[int]:
     groups = _group_consecutive(candidates, max_gap=1)
     thin_lines = [
         int(round(np.mean(g))) for g in groups
-        if 1 <= len(g) <= 4 and int(h * 0.18) <= int(round(np.mean(g))) <= int(h * 0.99)
+        if 1 <= len(g) <= 7 and int(h * 0.18) <= int(round(np.mean(g))) <= int(h * 0.99)
     ]
     if len(thin_lines) < 3:
         raise RuntimeError("水平グリッド線を3本以上検出できませんでした。グラフ全体と0%線が入った画像を使ってください。")
